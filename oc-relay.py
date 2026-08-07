@@ -96,7 +96,8 @@ def read_endpoints(config_path: str | None = None) -> list:
             "endpoints config not found: %s\n"
             "  copy endpoints.example.jsonc to endpoints.jsonc and fill it in"
             % p)
-    with open(p, encoding="utf-8") as f:
+    with open(p, encoding="utf-8-sig") as f:
+        # utf-8-sig transparently strips a BOM if present (Notepad/VS Code).
         data = json.loads(_strip_jsonc(f.read()))
     if not isinstance(data, dict) or not isinstance(data.get("endpoints"), list) \
             or not data["endpoints"]:
@@ -109,7 +110,10 @@ def read_endpoints(config_path: str | None = None) -> list:
         if not name or not url:
             raise SystemExit("each endpoint needs 'name' and 'url' in %s" % p)
         port = int(e.get("port", base + i))
-        out.append((str(name), str(url).rstrip("/"), str(e.get("apiKey") or ""), port))
+        # The key also travels through TSV (--endpoints) on its way to the env
+        # var; tabs/newlines would break that, and are never valid in a key.
+        key = (str(e.get("apiKey") or "").replace("\t", "").replace("\n", ""))
+        out.append((str(name), str(url).rstrip("/"), key, port))
     return out
 
 
@@ -184,14 +188,25 @@ class Relay(http.server.BaseHTTPRequestHandler):
         # base='/v1' + client '/v1/messages'  ->  '/v1/messages'
         base = parsed.path.rstrip("/")
         req = self.path
-        if base and (req == base or req.startswith(base + "/")):
-            req = req[len(base):] or "/"
-        path = base + req + (("?" + parsed.query) if parsed.query else "")
+        if base:
+            if req == base:
+                req = ""
+            elif req.startswith(base + "/"):
+                req = req[len(base):]
+        path = base + req
+        # Query strings belong to the caller; only add the upstream's own query
+        # if the caller sent none (avoids a double '?').
+        if "?" not in path and parsed.query:
+            path += "?" + parsed.query
 
-        # acquire a pooled connection; retry once if it went stale while idle
+        # acquire a pooled connection; retry once if it went stale while idle.
+        # Never retry non-idempotent writes (a retried POST could generate the
+        # request twice upstream).
+        idempotent = self.command in ("GET", "HEAD", "OPTIONS", "DELETE")
+        attempts = 2 if idempotent else 1
         conn = _pool_get(parsed.scheme, host, port, self.timeout)
         resp = None
-        for _attempt in range(2):
+        for _attempt in range(attempts):
             try:
                 conn.request(self.command, path, body=body, headers=headers)
                 resp = conn.getresponse()
@@ -201,7 +216,7 @@ class Relay(http.server.BaseHTTPRequestHandler):
                     conn.close()
                 except Exception:
                     pass
-                if _attempt == 1:
+                if _attempt == attempts - 1:
                     raise
                 conn = _pool_get(parsed.scheme, host, port, self.timeout)
 
@@ -274,7 +289,9 @@ def main() -> None:
 
     if args.target:
         upstream = args.target.rstrip("/")
-        api_key = args.key
+        # --key wins; otherwise read MSSH_KEY (the mssh wrappers pass the API
+        # key via env so it never appears in process listings/argv).
+        api_key = args.key or os.environ.get("MSSH_KEY") or None
     else:
         raise SystemExit("no --target given (and no automated provider lookup); "
                          "use --endpoints to see the configured endpoints, or run via mssh")

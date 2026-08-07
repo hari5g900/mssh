@@ -51,10 +51,12 @@ if [ ! -f "$CONFIG" ]; then
 fi
 
 pids=()
-trap 'for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done' EXIT
+trap 'for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done; sleep 0.5; for p in "${pids[@]}"; do kill -9 "$p" 2>/dev/null || true; done' EXIT
 
 # --- read endpoints (TSV: name<TAB>url<TAB>apiKey<TAB>port) ---
-mapfile -t EPS < <(python3 "$RELAY" --endpoints "$CONFIG")
+# while-read keeps bash 3.2 (macOS default) working; mapfile needs bash 4+.
+EPS=()
+while IFS= read -r line; do EPS+=("$line"); done < <(python3 "$RELAY" --endpoints "$CONFIG")
 if [ "${#EPS[@]}" -eq 0 ]; then
     echo "error: no endpoints in $CONFIG" >&2
     exit 1
@@ -71,16 +73,19 @@ for line in "${EPS[@]}"; do
     idx=$((idx + 1))
     ports+=("$port")
 
-    python3 "$RELAY" --target "$url" --port "$port" \
-        ${key:+--key "$key"} 2>"$TMPLOG/mssh-$name.log" &
+    # API key via env var, not argv (stays out of /proc cmdline and can't
+    # inject extra arguments).
+    MSSH_KEY="$key" python3 "$RELAY" --target "$url" --port "$port" \
+        2>"$TMPLOG/mssh-$name.log" &
     pids+=("$!")
 
-    base="${url%/}"
-    case "$base" in */v1) base="${base%/v1}" ;; esac
+    # Remote talks to the LOCAL forwarded port, never the upstream URL.
+    local_url="http://127.0.0.1:$port"
     envname="$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')"
-    export_str+=" ${envname}_BASE_URL=$base"
+    # single-quote the values (config-derived, fixed-form)
+    export_str+=" ${envname}_BASE_URL='$local_url'"
     if [ "$first" = "1" ]; then
-        export_str+=" ANTHROPIC_BASE_URL=$base LLM_BASE_URL=$base/v1"
+        export_str+=" ANTHROPIC_BASE_URL='$local_url' LLM_BASE_URL='$local_url/v1'"
         first=0
     fi
 

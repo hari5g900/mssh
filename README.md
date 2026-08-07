@@ -139,8 +139,9 @@ function mssh { & "C:\path\to\mssh\mssh.ps1" @args }
 |---|---|
 | `MSSH_CONFIG` | endpoints config path (default: `endpoints.jsonc` beside the script) |
 
-Extra ssh flags pass through directly after options: `mssh -A -p 2222 user@host`.
-Ports come from the config file (defaults `18080, 18081, ...` per endpoint).
+Extra ssh flags pass through directly after options: `mssh -A -p 2222 user@host`
+(`-A` forwards your ssh-agent, same as `ssh -A`). Ports come from the config
+file (defaults `18080, 18081, ...` per endpoint).
 
 ### Relay (`oc-relay.py`)
 

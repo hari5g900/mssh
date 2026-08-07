@@ -88,10 +88,20 @@ $ports = [System.Collections.ArrayList]::new()
 
 function Start-OneRelay {
     param($Ep, [string]$Log)
-    $argsStr = '"{0}" --target "{1}" --port {2}' -f $Relay, $Ep.Url, $Ep.Port
-    if ($Ep.Key) { $argsStr += ' --key "{0}"' -f $Ep.Key }
-    return (Start-Process -FilePath python -ArgumentList $argsStr `
-        -RedirectStandardError $Log -WindowStyle Hidden -PassThru)
+    # Values are wrapped in double quotes for the Windows command line; escape
+    # any embedded quote so config data can't break out of its argument.
+    $u = $Ep.Url.Replace('"', '\"')
+    $argsStr = '"{0}" --target "{1}" --port {2}' -f $Relay, $u, $Ep.Port
+    # Pass the API key via the environment, not the command line (no --key):
+    # it never shows up in process listings and can't inject extra args.
+    $oldKey = $env:MSSH_KEY
+    try {
+        if ($Ep.Key) { $env:MSSH_KEY = $Ep.Key }
+        return (Start-Process -FilePath python -ArgumentList $argsStr `
+            -RedirectStandardError $Log -WindowStyle Hidden -PassThru)
+    } finally {
+        $env:MSSH_KEY = $oldKey
+    }
 }
 
 $first = $true
@@ -101,13 +111,14 @@ foreach ($ep in $eps) {
     [void]$procs.Add($p); [void]$logs.Add($log); [void]$ports.Add($ep.Port)
     [void]$fwdArgs.Add('-R'); [void]$fwdArgs.Add("127.0.0.1:$($ep.Port):127.0.0.1:$($ep.Port)")
 
-    $base = $ep.Url
-    if ($base.EndsWith('/v1')) { $base = $base.Substring(0, $base.Length - 3) }
+    # The remote talks to the LOCAL forwarded port, never the upstream URL.
+    $localUrl = "http://127.0.0.1:$($ep.Port)"
     $envName = ($ep.Name.ToUpper() -replace '[^A-Z0-9]', '_')
-    [void]$exportParts.Add("${envName}_BASE_URL=$base")
+    # single-quote values: they're fixed-form and config-derived
+    [void]$exportParts.Add("${envName}_BASE_URL='$localUrl'")
     if ($first) {
-        [void]$exportParts.Add("ANTHROPIC_BASE_URL=$base")
-        [void]$exportParts.Add("LLM_BASE_URL=$base/v1")
+        [void]$exportParts.Add("ANTHROPIC_BASE_URL='$localUrl'")
+        [void]$exportParts.Add("LLM_BASE_URL='$localUrl/v1'")
         $first = $false
     }
 }
