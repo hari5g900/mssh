@@ -21,6 +21,7 @@ import http.server
 import json
 import os
 import re
+import socket
 import sys
 import threading
 import urllib.parse
@@ -260,6 +261,21 @@ class Relay(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def _probe_upstream(upstream: str) -> bool:
+    """Non-fatal startup check: can we reach the real gateway host:port from
+    THIS machine? This is where the VPN/tailnet requirement lives — the relay
+    must reach it before the remote can."""
+    try:
+        p = urllib.parse.urlsplit(upstream)
+        host = p.hostname
+        port = p.port or (443 if p.scheme == "https" else 80)
+        s = socket.create_connection((host, port), timeout=3)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--port", type=int, default=18080)
@@ -281,6 +297,12 @@ def main() -> None:
 
     if "/v1" not in upstream.split("//")[-1].split("/")[-2:] and not upstream.endswith("/"):
         print("relay: note: upstream does not end in /v1: %s" % upstream,
+              file=sys.stderr)
+
+    if not _probe_upstream(upstream):
+        host = urllib.parse.urlsplit(upstream).hostname
+        print("relay: WARNING: %s is unreachable from THIS machine (VPN/tailnet down?) "
+              "— bridging will fail until this machine can reach it" % host,
               file=sys.stderr)
 
     Relay.upstream = upstream

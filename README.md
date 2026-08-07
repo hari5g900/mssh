@@ -228,6 +228,10 @@ instance, so load is naturally sharded across machines.
 - **"relay did not start" / "relay failed to start"** — check the printed log
   path (e.g. `%TEMP%\mssh-deepseek-*.log`, `/tmp/mssh-*.log`). Common causes:
   no active `model` in config, provider id missing, or port already in use.
+- **`relay: WARNING: <host> is unreachable from THIS machine`** — the gateway is
+  not reachable from *this* machine right now (e.g. Tailscale/FortiClient VPN
+  down, or off the right network). The relay keeps serving, but bridged requests
+  will fail until this machine can reach it; the remote can never fix this.
 - **`claude` on the remote says it can't reach the endpoint** — confirm the
   tunnel: `curl -s http://127.0.0.1:<RemotePort>/v1/models`.
 - **Port conflict on the remote** — bump `-RemotePort`/`MSSH_REMOTE_PORT`
