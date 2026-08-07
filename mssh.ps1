@@ -59,6 +59,8 @@ param(
     [int]$QwenRemotePort = 18081,
 
     [switch]$NoQwen,
+    [Alias('A')]
+    [switch]$ForwardAgent,
     [string]$SshArgs = ""
 )
 
@@ -120,6 +122,8 @@ if (-not $NoQwen) {
 $fwdDeep = "-R 127.0.0.1:${RemotePort}:127.0.0.1:${LocalPort}"
 $exportStr = "export ANTHROPIC_BASE_URL=http://127.0.0.1:$RemotePort ANTHROPIC_API_KEY=local-bridge LLM_BASE_URL=http://127.0.0.1:$RemotePort/v1"
 $sshArgsArr = @($fwdDeep) + $extra
+
+if ($ForwardAgent) { $sshArgsArr += '-A' }
 
 if ($relayQwen) {
     $fwdQwen = "-R 127.0.0.1:${QwenRemotePort}:127.0.0.1:${QwenLocalPort}"

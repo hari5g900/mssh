@@ -136,6 +136,7 @@ Linux instructions above (relay config still comes from
 | `-QwenLocalPort` | `18081` | qwen relay listen port (local) |
 | `-QwenRemotePort` | `18081` | qwen port exposed on the remote |
 | `-NoQwen` | off | skip the qwen bridge |
+| `-A` (alias `-ForwardAgent`) | off | enable SSH agent forwarding (`ssh -A`) |
 | `-SshArgs` | `""` | extra ssh options (`"-p 2222 -i <key>"`) |
 
 ### bash (`mssh`)
