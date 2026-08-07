@@ -58,6 +58,13 @@ fi
 mkdir -p "$DEST"
 install -m 755 "$HERE/mssh" "$DEST/mssh"
 install -m 755 "$HERE/oc-relay.py" "$DEST/oc-relay.py"
+if [ -f "$HERE/endpoints.example.jsonc" ]; then
+    install -m 644 "$HERE/endpoints.example.jsonc" "$DEST/endpoints.example.jsonc"
+    if [ ! -f "$DEST/endpoints.jsonc" ]; then
+        install -m 644 "$HERE/endpoints.example.jsonc" "$DEST/endpoints.jsonc"
+        echo "created $DEST/endpoints.jsonc from the example - fill it in."
+    fi
+fi
 
 echo "Installed mssh + oc-relay.py -> $DEST"
 

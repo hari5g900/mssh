@@ -1,41 +1,72 @@
-# mssh — SSH that bridges your opencode model endpoints
+# mssh — forward your LLM endpoints to any machine over SSH
 
-`mssh` is a drop-in replacement for `ssh` that also bridges **this opencode
-session's model endpoints** to whatever machine you SSH into, so remote tools
-(claude shell, opencode) use the same models — while the API keys stay on your
-machine and **nothing needs to be installed on the remote**.
+`mssh` is a drop-in replacement for `ssh` that also **reverse-forwards the LLM
+endpoint(s) you list in a config file**, so tools on the remote box (claude,
+opencode, curl — anything that speaks OpenAI or Anthropic) can use the models
+*this* machine can reach.
 
-Works with remote machines you can only reach over SSH (air-gapped hosts,
-shared boxes with no package install permission, no VPN/tailscale client).
+- **Configurable, not client-specific:** you point it at your endpoints; it does
+  pure port forwarding. No opencode/claude knowledge is baked in (in this repo's
+  own setup the config happens to be an opencode-style file).
+- **Keys stay local:** each endpoint's API key is injected on this machine; the
+  remote never sees it and **nothing is installed on the remote** — just sshd and
+  whatever tools you already use there.
+- **Works anywhere SSH does:** air-gapped hosts, shared boxes with no install
+  permissions, hosts with no VPN/tailscale client.
 
 ---
 
-## What it does
+## How it works
 
-For each SSH session, `mssh`:
+```
+THIS machine (owns the keys, can reach the gateways — e.g. via VPN/tailnet)
+  ├─ oc-relay (endpoint 1) :18080 ─┐
+  ├─ oc-relay (endpoint 2) :18081 ─┤── ssh -R ... ──►  REMOTE
+  │                                │                   ├─ <NAME>_BASE_URL (per endpoint)
+  └─ keys never leave here  ◄──────┘                   ├─ ANTHROPIC_BASE_URL  (first)
+                                                       └─ LLM_BASE_URL        (first)
+```
 
-1. Reads the **active provider** (and its `baseURL` + `apiKey`) from your local
-   `~/.config/opencode/opencode.jsonc` (or `.json`), plus the `vllm`/qwen
-   provider used by subagents.
-2. Starts a tiny **local relay** (`oc-relay.py`) per endpoint that forwards
-   traffic to the real gateway and **injects the API key locally** — it never
-   travels to the remote.
-3. **Reverse-forwards** each relay port to the remote via `ssh -R`.
-4. Exports on the remote:
-   - `ANTHROPIC_BASE_URL` → deepseek gateway (so `claude` just works)
-   - `LLM_BASE_URL` → deepseek OpenAI endpoint (for opencode)
-   - `QWEN_BASE_URL` → qwen vLLM endpoint
-5. Starts your remote shell (or runs your command), then cleans everything up
+For each endpoint in the config, `mssh`:
+
+1. starts a **local relay** (`oc-relay.py`) that forwards requests to the real
+   gateway and injects the API key locally,
+2. **reverse-forwards** the relay port to the remote (`ssh -R`, same port both
+   ends),
+3. exports on the remote:
+   - `<NAME>_BASE_URL=http://127.0.0.1:<port>` for **every** endpoint,
+   - plus `ANTHROPIC_BASE_URL` and `LLM_BASE_URL` for the **first** endpoint
+     (convenience aliases for claude and OpenAI-compatible clients),
+4. starts your remote shell (or runs your command), then cleans everything up
    when you disconnect.
 
+---
+
+## The config file
+
+Copy `endpoints.example.jsonc` to `endpoints.jsonc` **in the repo root** and
+fill it in. `mssh` re-reads it on **every run** — edit the file, no reinstall.
+
+```jsonc
+{
+  "endpoints": [
+    // name:   becomes <NAME>_BASE_URL on the remote
+    // url:    base URL of the server THIS machine can reach (http/https, /v1-style)
+    // apiKey: optional; injected locally, never sent to the remote
+    // port:   port on BOTH this machine and the remote (default 18080, 18081, ...)
+    { "name": "deepseek", "url": "http://<your-server-1>:30800/v1", "apiKey": "", "port": 18080 },
+    { "name": "qwen",     "url": "http://<your-server-2>:5007/v1", "port": 18081 }
+  ]
+}
 ```
-THIS machine (has the keys, reaches the gateways)
-  ├─ oc-relay (deepseek) :18080 ─┐
-  ├─ oc-relay (qwen)     :18081 ─┤── ssh -R ... ──►  REMOTE
-  │                              │                   ├─ claude  → ANTHROPIC_BASE_URL
-  │                              │                   └─ opencode→ LLM_BASE_URL / QWEN_BASE_URL
-  └─ API keys stay here  ◄───────┘                    (nothing installed there)
-```
+
+- `endpoints.jsonc` is **gitignored** — don't commit your real `apiKey`s (this
+  repo is public; git history is forever).
+- Any JSON/JSONC file with an `endpoints` array works — the schema is data, not
+  a product. (An opencode/codex-style config is just another JSONC file that
+  happens to describe the same endpoints.)
+- If you don't have `endpoints.jsonc` yet, `oc-relay.py` explains exactly what
+  to do when `mssh` runs.
 
 ---
 
@@ -43,150 +74,97 @@ THIS machine (has the keys, reaches the gateways)
 
 | File | Purpose |
 |---|---|
-| `oc-relay.py` | Local HTTP relay: detects the provider from the opencode config, forwards to the gateway, injects the key, streams responses, keeps upstream connections pooled. |
+| `oc-relay.py` | Relay: forwards to a real endpoint, injects the key locally, streams responses, pools upstream connections, and reads `--endpoints` as TSV for mssh. |
 | `mssh.ps1` | PowerShell wrapper (Windows). |
 | `mssh` | bash wrapper (macOS / Linux / WSL). |
-| `install.sh` | Installer (macOS / Linux): copies `mssh` + `oc-relay.py` together into a bin dir. |
+| `install.sh` | Installer (macOS / Linux): copies `mssh` + `oc-relay.py` (and the endpoint template) into a bin dir. |
+| `endpoints.example.jsonc` | Template you copy to `endpoints.jsonc` and fill in. |
 
 ---
 
 ## Prerequisites
 
-- **Local machine:** Python 3.10+ (for the relay), OpenSSH client (built into
-  Windows 10/11, or installed on Linux/WSL), and `opencode` with the provider(s)
-  configured in `~/.config/opencode/opencode.jsonc`.
-- **Remote:** only what you already use to connect over SSH — just `sshd` and
-  your own tools (e.g. `claude`). Nothing is installed by `mssh`.
-  *(The endpoints the relay targets must be reachable from this machine, which
-  is already true since opencode uses them.)*
+- **Local machine (the one with the keys):** Python 3.10+ (for the relay),
+  OpenSSH client, and network access to your gateways (e.g. FortiClient VPN,
+  Tailscale, LAN).
+- **Remote:** only what you already use to connect over SSH — `sshd` and your
+  own tools (claude, opencode, ...). Nothing is installed by `mssh`.
+  *(If the gateways are behind a VPN/tailnet, only this machine needs to be on
+  it — the remote never does.)*
 
 ## Quick start
 
 ```bash
-# Put the repo on your PATH (copy mssh.ps1 + mssh + oc-relay.py into a bin dir)
+# 1) configure the endpoints
+cp endpoints.example.jsonc endpoints.jsonc   # then edit endpoints.jsonc
 
-# PowerShell: add to your $PROFILE so `mssh` is a normal command
+# 2) connect
+mssh mybox                  # forward all endpoints, interactive shell
+mssh mybox "claude"         # and run claude on the remote
+mssh -A mybox               # also forward your ssh-agent
+```
+
+On the remote, your tools now see localhost endpoints that act like your real
+servers:
+
+```bash
+claude                      # uses $ANTHROPIC_BASE_URL (first endpoint)
+opencode                    # point it at $LLM_BASE_URL / <NAME>_BASE_URL
+curl -s http://127.0.0.1:18080/v1/messages   # sanity-check a forward
+```
+
+**Windows PowerShell:** add to `$PROFILE`:
+```powershell
 function mssh { & "C:\path\to\mssh\mssh.ps1" @args }
-
-# WSL / Linux: install the bash wrapper AND the relay into the same directory
-install -m 755 mssh oc-relay.py ~/.local/bin/
 ```
-
-Ensure the remote is reachable via an alias or `user@host`:
-
-```
-Host mybox
-    HostName mybox.example.com
-    User me
-```
-
-Connect:
-
-```bash
-mssh mybox                  # interactive remote shell, models bridged
-mssh mybox "claude"         # run claude on the remote → uses your deepseek model
-mssh -p 2222 user@host      # extra ssh options pass through
-mssh mybox "curl -s http://127.0.0.1:18080/v1/models"   # check the tunnel
-```
-
-On the remote you can now use, for example:
-
-```bash
-claude                      # respects ANTHROPIC_BASE_URL (already exported)
-opencode                    # respects LLM_BASE_URL / QWEN_BASE_URL
-```
+(or use the `install.sh` on macOS/Linux/WSL).
 
 ---
 
-## Installing on macOS (and Linux)
-
-The bash `mssh` is the macOS/Linux client; `mssh.ps1` is Windows-only. It needs
-only `python3`, `ssh`, and `bash` — all present on macOS by default (add
-`python3` via Command Line Tools: `xcode-select --install`, or
-`brew install python`).
-
-```bash
-git clone git@github.com:hari5g900/mssh.git   # or: https://github.com/hari5g900/mssh.git
-cd mssh
-bash install.sh                 # -> ~/.local/bin (or $XDG_BIN_DIR / ~/bin if they exist)
-# or pick a directory explicitly:
-bash install.sh ~/bin
-```
-
-`install.sh` copies `mssh` and `oc-relay.py` **together** into one directory
-(they must stay side by side) and makes them executable; it prints a PATH line
-to add if the directory isn't already on your `PATH`.
-
-After that, usage, configuration, and the test harness are identical to the
-Linux instructions above (relay config still comes from
-`~/.config/opencode/opencode.jsonc`).
-
----
-
-## Configuration
+## Options
 
 ### PowerShell (`mssh.ps1`)
 
-| Option | Default | Meaning |
-|---|---|---|
-| `-Target` | — | ssh destination (positional) |
-| `-Command` | — | command to run instead of an interactive shell |
-| `-LocalPort` | `18080` | deepseek relay listen port (local) |
-| `-RemotePort` | `18080` | deepseek port exposed on the remote |
-| `-QwenLocalPort` | `18081` | qwen relay listen port (local) |
-| `-QwenRemotePort` | `18081` | qwen port exposed on the remote |
-| `-NoQwen` | off | skip the qwen bridge |
-| `-A` (alias `-ForwardAgent`) | off | enable SSH agent forwarding (`ssh -A`) |
-| `-SshArgs` | `""` | extra ssh options (`"-p 2222 -i <key>"`) |
+| Option | Meaning |
+|---|---|
+| `-Target` | ssh destination (positional) |
+| `-Command` | command to run instead of an interactive shell |
+| `-Config <path>` | endpoints config file (default: `endpoints.jsonc` beside the script) |
+| `-A` / `-ForwardAgent` | enable SSH agent forwarding (`ssh -A`) |
+| `-SshArgs "<opts>"` | extra ssh options, e.g. `"-p 2222 -i <key>"` |
 
 ### bash (`mssh`)
 
-| Env var | Default | Meaning |
-|---|---|---|
-| `MSSH_LOCAL_PORT` | `18080` | deepseek relay listen port |
-| `MSSH_REMOTE_PORT` | `18080` | deepseek port on the remote |
-| `MSSH_QWEN_LOCAL_PORT` | `18081` | qwen relay listen port |
-| `MSSH_QWEN_REMOTE_PORT` | `18081` | qwen port on the remote |
-| `MSSH_NO_QWEN` | `0` | set to `1` to skip the qwen bridge |
+| Env var | Meaning |
+|---|---|
+| `MSSH_CONFIG` | endpoints config path (default: `endpoints.jsonc` beside the script) |
+
+Extra ssh flags pass through directly after options: `mssh -A -p 2222 user@host`.
+Ports come from the config file (defaults `18080, 18081, ...` per endpoint).
 
 ### Relay (`oc-relay.py`)
 
-Usually run via `mssh`, but usable standalone:
-
 ```bash
-python oc-relay.py --port 18080                    # auto-detect active provider
-python oc-relay.py --model vllm --port 18081       # pick a provider by id
-python oc-relay.py --target http://host:port/v1 --key KEY --port 18080  # override
+python oc-relay.py --endpoints [PATH]       # print the configured endpoints (TSV)
+python oc-relay.py --target http://host:PORT/v1 --key KEY --port 18080   # one endpoint
 ```
 
 ---
 
 ## How the relay works
 
-- **Auto-detection:** parses `opencode.jsonc` (URL-safe comment stripping),
-  finds the active `model`, looks up its provider, and reads `options.baseURL`
-  and `options.apiKey`.
-- **Key injection:** strips any incoming `Authorization` / `x-api-key` and
-  injects the real key as **both** `Authorization: Bearer` and `x-api-key`,
-  so OpenAI-style callers *and* Anthropic-style callers (`claude`) both
-  authenticate against the gateway.
-- **Path routing:** joins the upstream base path with the client path without
-  duplicating `/v1` (base `/v1` + `/v1/messages` → `/v1/messages`).
-- **Streaming:** responses are relayed byte-by-byte (64 KB chunks) with the
-  client leg closed at the end — SSE token streaming works in near real time.
-- **Keep-alive pooling:** upstream connections are reused across requests
-  (bounded pool, lock-protected, stale connections retried once), removing the
-  per-request TCP handshake (~15 ms added latency → ~0).
-- **Loopback only:** relays bind to `127.0.0.1`; nothing is exposed to the LAN.
-
-### Which endpoints get bridged
-
-- The **active model's** provider (e.g. `deepseek2/deepseek-v4-flash` →
-  `http://<internal-gateway-ip>:<port>/v1`).
-- The **`vllm`** provider used by subagents / `small_model`
-  (`http://<tailscale-ip>:5007/v1`). Configured per your `opencode.jsonc`.
-- To change which providers are bridged, edit the config or override with
-  `--target`/`MSSH_NO_QWEN`.
+- **Config-driven:** reads the endpoint list from `endpoints.jsonc` (JSON/JSONC,
+  comment-safe parsing) — no hard-coded clients.
+- **Key injection:** strips whatever auth the caller sent and injects the real
+  key as **both** `Authorization: Bearer` and `x-api-key`, so OpenAI-style and
+  Anthropic-style (`claude`) callers both authenticate.
+- **Path routing:** joins the endpoint base path with the client path without
+  duplicating `/v1` (`/v1` + `/v1/messages` → `/v1/messages`).
+- **Streaming:** responses relay byte-by-byte with the client leg closed at the
+  end — SSE token streaming works in near real time.
+- **Keep-alive pooling:** upstream connections reused (bounded pool, stale
+  connections retried once) — essentially zero added latency per request.
+- **Loopback only:** relays bind to `127.0.0.1`; nothing is exposed on the LAN.
 
 ---
 
@@ -197,58 +175,50 @@ Measured on loopback against a mock gateway:
 | Metric | Value |
 |---|---|
 | Added latency per request | **~0 ms** (parity with a direct connection) |
-| 16 concurrent streaming `/v1/messages` (opencode `ultracode` cap) | 16/16 OK, wall time flat |
+| 16 concurrent streaming `/v1/messages` | 16/16 OK, wall time flat |
 | 32 concurrent streams | 32/32 OK |
-| Relay footprint | ~30–50 MB RAM, a few % of one core |
+| Relay footprint | ~30–50 MB RAM per relay, a few % of one core |
 
-Streaming is I/O-bound, not CPU-bound, so the relay is *not* the bottleneck for
-concurrent agent workloads. With `mssh`, each remote also gets its own relay
-instance, so load is naturally sharded across machines.
+Each remote `mssh` run gets its own relays, so load is naturally sharded across
+machines.
 
 ---
 
-## Security notes
+## Security
 
 - **API keys never leave this machine** — the relay injects them locally; the
   remote only ever sees `127.0.0.1` endpoints with no credentials required.
 - **Nothing is installed on the remote** — only SSH port forwarding and shell
-  environment variables are used.
+  variables.
 - Relays listen on **loopback only** and are torn down when the SSH session
   ends.
 - Forwarded ports on the remote bind to `127.0.0.1` (no `GatewayPorts`
-  required); other users on the remote could attempt to reach them — the
-  injected key is the real protection, and relay ports are only up for the
-  duration of your session.
-- Do **not** commit your `opencode.jsonc` credentials to this repo; the relay
-  reads the key from your user config at runtime.
+  needed); other users on the remote could attempt to reach them while your
+  session is up — the injected key is the real protection.
+- **Don't commit real `apiKey`s** — `endpoints.jsonc` is gitignored.
 
 ---
 
 ## Troubleshooting
 
-- **"relay did not start" / "relay failed to start"** — check the printed log
-  path (e.g. `%TEMP%\mssh-deepseek-*.log`, `/tmp/mssh-*.log`). Common causes:
-  no active `model` in config, provider id missing, or port already in use.
-- **`relay: WARNING: <host> is unreachable from THIS machine`** — the gateway is
-  not reachable from *this* machine right now (e.g. Tailscale/FortiClient VPN
-  down, or off the right network). The relay keeps serving, but bridged requests
-  will fail until this machine can reach it; the remote can never fix this.
-- **`claude` on the remote says it can't reach the endpoint** — confirm the
-  tunnel: `curl -s http://127.0.0.1:<RemotePort>/v1/models`.
-- **Port conflict on the remote** — bump `-RemotePort`/`MSSH_REMOTE_PORT`
-  (and the qwen equivalents) to free ports.
-- **qwen bridge not wanted or unreachable** — `-NoQwen` /
-  `MSSH_NO_QWEN=1`.
-- **Gateway rejects auth** — the relay injects both `Authorization` and
-  `x-api-key`; if your gateway expects a different header name/scheme, adjust
+- **`endpoints config not found`** — copy `endpoints.example.jsonc` →
+  `endpoints.jsonc` and fill it in (works for both `mssh` and the relay).
+- **`relay: WARNING: <host> is unreachable from THIS machine`** — the gateway
+  is not reachable from *this* machine right now (VPN/Tailscale down, wrong
+  network). The remote can never fix this; reconnect this machine first.
+- **`claude` on the remote can't reach the endpoint** — confirm the tunnel:
+  `curl -s http://127.0.0.1:<port>/v1/messages`.
+- **Port conflict on the remote** — change the `port` for that endpoint in
+  `endpoints.jsonc`.
+- **Auth rejected at the gateway** — `oc-relay.py` injects both `Authorization`
+  and `x-api-key`; if your gateway expects another header, adjust
   `oc-relay.py`'s `_forward()`.
 
 ---
 
 ## Development / testing
 
-The repo ships a self-contained test harness (Python 3.10+, no dependencies).
-From the repo root:
+Self-contained tests (Python 3.10+, no deps). From the repo root:
 
 ```bash
 python tests/test_relay.py         # auth injection, wrong-key override, path routing, SSE
@@ -256,9 +226,7 @@ python tests/bench_relay.py        # latency: direct vs. through the relay (keep
 python tests/test_concurrency.py   # 4/16/32 concurrent streaming streams
 ```
 
-- `tests/mock_server.py` is a tiny fake gateway requiring an API key, used by
-  the other tests.
-- Everything runs on loopback; nothing is touched outside the repo.
+`tests/mock_server.py` is a tiny fake gateway; everything runs on loopback.
 
 ---
 

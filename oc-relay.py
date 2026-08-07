@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-oc-relay.py - Local relay that bridges THIS opencode session's model endpoint.
+oc-relay.py - Forward LLM endpoint(s) from this machine to a remote, via mssh.
 
-Auto-detects the active provider's baseURL (and API key) from the opencode
-config, then serves an OpenAI-compatible endpoint on 127.0.0.1:<port> that
-forwards every request to the real gateway, injecting the Authorization header
-from the local config. The API key therefore never leaves this machine.
+Pure port forwarding with local key injection: it serves an HTTP endpoint on
+127.0.0.1:<port> and forwards every request to the REAL gateway that THIS
+machine can reach, injecting the API key locally. The key never leaves this
+machine and the remote only ever talks to loopback.
 
-Used by mssh so a remote host can reach the same model this opencode session
-uses, via an SSH reverse tunnel.
+mssh reads the endpoints to forward from a config file (endpoints.jsonc in the
+repo root; see endpoints.example.jsonc), then runs one relay per endpoint with
+--target/--key/--port. --endpoints prints that config as TSV for mssh.
+
+Client-agnostic: anything that speaks OpenAI or Anthropic (/v1/messages) works
+on the remote — claude, opencode, curl, etc.
 
 Usage:
-    oc-relay.py [--port 18080] [--target http://HOST:PORT/v1] [--key KEY]
-                [--model deepseek2]
+    oc-relay.py --port 18080 --target http://HOST:PORT/v1 [--key KEY]
+    oc-relay.py --endpoints [PATH]        # print endpoint list as TSV, exit
 """
 
 import argparse
@@ -25,11 +29,6 @@ import socket
 import sys
 import threading
 import urllib.parse
-
-_CONFIG_CANDIDATES = (
-    ".config/opencode/opencode.jsonc",
-    ".config/opencode/opencode.json",
-)
 
 
 def _strip_jsonc(text: str) -> str:
@@ -81,21 +80,37 @@ def _strip_jsonc(text: str) -> str:
     return text
 
 
-def _home() -> str:
-    for env in ("USERPROFILE", "HOME"):
-        v = os.environ.get(env)
-        if v:
-            return v
-    return os.path.expanduser("~")
+def read_endpoints(config_path: str | None = None) -> list:
+    """Read the endpoints to forward from the mssh config file.
 
-
-def _find_config() -> str | None:
-    home = _home()
-    for rel in _CONFIG_CANDIDATES:
-        p = os.path.join(home, rel.replace("/", os.sep))
-        if os.path.exists(p):
-            return p
-    return None
+    Format (opencode/codex-style JSONC):
+        { "endpoints": [ { "name", "url", "apiKey"?, "port"? }, ... ], "port"? }
+    Returns a list of (name, url, api_key, port). This is data-driven: no
+    client is hard-coded; the user fills endpoints.jsonc (see
+    endpoints.example.jsonc)."""
+    p = config_path
+    if not p:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "endpoints.jsonc")
+    if not os.path.exists(p):
+        raise SystemExit(
+            "endpoints config not found: %s\n"
+            "  copy endpoints.example.jsonc to endpoints.jsonc and fill it in"
+            % p)
+    with open(p, encoding="utf-8") as f:
+        data = json.loads(_strip_jsonc(f.read()))
+    if not isinstance(data, dict) or not isinstance(data.get("endpoints"), list) \
+            or not data["endpoints"]:
+        raise SystemExit("no 'endpoints' array found in %s" % p)
+    base = int(data.get("port", 18080))
+    out = []
+    for i, e in enumerate(data["endpoints"]):
+        name = e.get("name")
+        url = e.get("url") or e.get("baseURL")
+        if not name or not url:
+            raise SystemExit("each endpoint needs 'name' and 'url' in %s" % p)
+        port = int(e.get("port", base + i))
+        out.append((str(name), str(url).rstrip("/"), str(e.get("apiKey") or ""), port))
+    return out
 
 
 # --- keep-alive connection pool (relay -> upstream gateway) ---
@@ -131,41 +146,6 @@ def _pool_put(conn, reusable: bool) -> None:
                 conn.close()
             except Exception:
                 pass
-
-
-def detect(model_id: str | None) -> dict:
-    """Return dict(provider, model, base_url, api_key) from opencode config."""
-    cfg_path = _find_config()
-    if not cfg_path:
-        raise SystemExit("No opencode config found under ~/.config/opencode")
-    with open(cfg_path, encoding="utf-8") as f:
-        data = json.loads(_strip_jsonc(f.read()))
-
-    providers = data.get("provider", {})
-    if not providers:
-        raise SystemExit("No providers configured in opencode config")
-
-    if model_id:
-        provider = model_id.split("/")[0]
-    else:
-        active = data.get("model", "")
-        if "/" not in active:
-            raise SystemExit("No active 'model' in config (and no --model given)")
-        provider = active.split("/")[0]
-
-    p = providers.get(provider)
-    if not p:
-        raise SystemExit("Provider '%s' not found in config (have: %s)"
-                         % (provider, ", ".join(providers)))
-    opts = p.get("options", {})
-    base = opts.get("baseURL") or opts.get("baseUrl")
-    if not base:
-        raise SystemExit("Provider '%s' has no baseURL in options" % provider)
-    return {
-        "provider": provider,
-        "base_url": base.rstrip("/"),
-        "api_key": opts.get("apiKey"),
-    }
 
 
 class Relay(http.server.BaseHTTPRequestHandler):
@@ -279,21 +259,25 @@ def _probe_upstream(upstream: str) -> bool:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--port", type=int, default=18080)
-    ap.add_argument("--target", help="override baseURL (http://host:port/v1)")
-    ap.add_argument("--key", help="override API key (none = inherit header)")
-    ap.add_argument("--model", help="provider id (default: active model)")
+    ap.add_argument("--endpoints", nargs="?", const="", metavar="PATH",
+                    help="print the endpoints from the config as TSV "
+                         "(name <TAB> url <TAB> apiKey <TAB> port) and exit")
+    ap.add_argument("--target", help="baseURL to forward to (http://host:port/v1)")
+    ap.add_argument("--key", help="API key to inject locally (none = inherit header)")
     ap.add_argument("--timeout", type=int, default=120)
     args = ap.parse_args()
+
+    if args.endpoints is not None:
+        for name, url, key, port in read_endpoints(args.endpoints or None):
+            print("%s\t%s\t%s\t%d" % (name, url, key, port))
+        sys.exit(0)
 
     if args.target:
         upstream = args.target.rstrip("/")
         api_key = args.key
     else:
-        cfg = detect(args.model)
-        upstream = cfg["base_url"]
-        api_key = cfg["api_key"]
-        print("relay: bridging %s -> %s" % (cfg["provider"], upstream),
-              file=sys.stderr)
+        raise SystemExit("no --target given (and no automated provider lookup); "
+                         "use --endpoints to see the configured endpoints, or run via mssh")
 
     if "/v1" not in upstream.split("//")[-1].split("/")[-2:] and not upstream.endswith("/"):
         print("relay: note: upstream does not end in /v1: %s" % upstream,

@@ -1,0 +1,25 @@
+{
+  // LLM endpoints to forward to the remote box when you run `mssh`.
+  //
+  // To use: copy this file to `endpoints.jsonc` and fill it in.
+  //   - name:   short label for this endpoint (becomes <NAME>_BASE_URL on the remote)
+  //   - url:    base URL of the inference server THIS machine can reach
+  //             (http/https, /v1-style — clients append /v1/... themselves)
+  //   - apiKey: optional; if set it is injected locally by the relay and never
+  //             sent to the remote box
+  //   - port:   port exposed on BOTH this machine and the remote
+  //             (defaults: 18080, 18081, ... in order; keep them unique)
+  //
+  // Every run of `mssh` re-reads this file and starts one relay + forward per
+  // endpoint. On the remote each endpoint gets:
+  //     export <NAME>_BASE_URL=http://127.0.0.1:<port>
+  // and the FIRST endpoint additionally gets ANTHROPIC_BASE_URL (for claude)
+  // and LLM_BASE_URL (for OpenAI-compatible clients).
+  //
+  // Do NOT commit real apiKeys here — endpoints.jsonc is gitignored; this
+  // repository is public and history is forever.
+  "endpoints": [
+    { "name": "deepseek", "url": "http://<your-server-1>:30800/v1", "apiKey": "", "port": 18080 },
+    { "name": "qwen",     "url": "http://<your-server-2>:5007/v1", "port": 18081 }
+  ]
+}
