@@ -45,7 +45,8 @@ THIS machine (has the keys, reaches the gateways)
 |---|---|
 | `oc-relay.py` | Local HTTP relay: detects the provider from the opencode config, forwards to the gateway, injects the key, streams responses, keeps upstream connections pooled. |
 | `mssh.ps1` | PowerShell wrapper (Windows). |
-| `mssh` | bash wrapper (WSL / Linux). |
+| `mssh` | bash wrapper (macOS / Linux / WSL). |
+| `install.sh` | Installer (macOS / Linux): copies `mssh` + `oc-relay.py` together into a bin dir. |
 
 ---
 
@@ -94,6 +95,31 @@ On the remote you can now use, for example:
 claude                      # respects ANTHROPIC_BASE_URL (already exported)
 opencode                    # respects LLM_BASE_URL / QWEN_BASE_URL
 ```
+
+---
+
+## Installing on macOS (and Linux)
+
+The bash `mssh` is the macOS/Linux client; `mssh.ps1` is Windows-only. It needs
+only `python3`, `ssh`, and `bash` — all present on macOS by default (add
+`python3` via Command Line Tools: `xcode-select --install`, or
+`brew install python`).
+
+```bash
+git clone git@github.com:hari5g900/mssh.git   # or: https://github.com/hari5g900/mssh.git
+cd mssh
+bash install.sh                 # -> ~/.local/bin (or $XDG_BIN_DIR / ~/bin if they exist)
+# or pick a directory explicitly:
+bash install.sh ~/bin
+```
+
+`install.sh` copies `mssh` and `oc-relay.py` **together** into one directory
+(they must stay side by side) and makes them executable; it prints a PATH line
+to add if the directory isn't already on your `PATH`.
+
+After that, usage, configuration, and the test harness are identical to the
+Linux instructions above (relay config still comes from
+`~/.config/opencode/opencode.jsonc`).
 
 ---
 
