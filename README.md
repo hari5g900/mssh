@@ -155,7 +155,7 @@ python oc-relay.py --target http://host:port/v1 --key KEY --port 18080  # overri
 ### Which endpoints get bridged
 
 - The **active model's** provider (e.g. `deepseek2/deepseek-v4-flash` →
-  `http://10.203.39.51:30800/v1`).
+  `http://<internal-gateway-ip>:<port>/v1`).
 - The **`vllm`** provider used by subagents / `small_model`
   (`http://<tailscale-ip>:5007/v1`). Configured per your `opencode.jsonc`.
 - To change which providers are bridged, edit the config or override with
