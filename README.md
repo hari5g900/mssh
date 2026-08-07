@@ -67,8 +67,8 @@ THIS machine (has the keys, reaches the gateways)
 # PowerShell: add to your $PROFILE so `mssh` is a normal command
 function mssh { & "C:\path\to\mssh\mssh.ps1" @args }
 
-# WSL / Linux
-install -m 755 /path/to/mssh /mssh ~/.local/bin/mssh
+# WSL / Linux: install the bash wrapper AND the relay into the same directory
+install -m 755 mssh oc-relay.py ~/.local/bin/
 ```
 
 Ensure the remote is reachable via an alias or `user@host`:
@@ -216,17 +216,18 @@ instance, so load is naturally sharded across machines.
 
 ## Development / testing
 
-The repo includes the test harness used during development:
+The repo ships a self-contained test harness (Python 3.10+, no dependencies).
+From the repo root:
 
-- `tests/test_relay.py` — auth injection, wrong-key override, path routing,
-  SSE streaming.
-- `tests/bench_relay.py` — latency: direct vs. through the relay (keep-alive).
-- `tests/test_concurrency.py` — 4/16/32 concurrent streaming streams through
-  the relay.
+```bash
+python tests/test_relay.py         # auth injection, wrong-key override, path routing, SSE
+python tests/bench_relay.py        # latency: direct vs. through the relay (keep-alive)
+python tests/test_concurrency.py   # 4/16/32 concurrent streaming streams
+```
 
-These spin up a mock gateway and the relay locally (loopback) and print PASS /
-latency numbers. They can be recreated with a few small scripts if you want to
-re-validate after changes.
+- `tests/mock_server.py` is a tiny fake gateway requiring an API key, used by
+  the other tests.
+- Everything runs on loopback; nothing is touched outside the repo.
 
 ---
 
