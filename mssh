@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# mssh - SSH into a machine while bridging THIS opencode session's model endpoints
+# to it, so remote tools (claude shell, opencode) use the same models.
+#
+# Starts local relays (oc-relay.py) for the active deepseek provider and the qwen
+# vLLM provider (injecting keys locally), reverse-forwards both to the remote, and
+# exports on the remote:
+#   ANTHROPIC_BASE_URL = http://127.0.0.1:<RemotePort>        (claude / deepseek)
+#   LLM_BASE_URL       = http://127.0.0.1:<RemotePort>/v1     (opencode deepseek)
+#   QWEN_BASE_URL      = http://127.0.0.1:<QwenRemotePort>/v1 (qwen vLLM)
+#
+# Requires nothing installed on the remote beyond sshd + your tools.
+#
+# Usage:
+#   mssh [ssh-options...] target [command...]
+#   mssh mybox                 # interactive shell, both models bridged
+#   mssh mybox "claude"        # run claude against your deepseek endpoint
+#
+# Env overrides:
+#   MSSH_LOCAL_PORT         deepseek relay local port   (default 18080)
+#   MSSH_REMOTE_PORT        deepseek port on remote     (default 18080)
+#   MSSH_QWEN_LOCAL_PORT    qwen relay local port       (default 18081)
+#   MSSH_QWEN_REMOTE_PORT   qwen port on remote         (default 18081)
+#   MSSH_NO_QWEN=1          skip the qwen bridge
+
+set -euo pipefail
+
+LOCAL="${MSSH_LOCAL_PORT:-18080}"
+REMOTE="${MSSH_REMOTE_PORT:-18080}"
+QWEN_LOCAL="${MSSH_QWEN_LOCAL_PORT:-18081}"
+QWEN_REMOTE="${MSSH_QWEN_REMOTE_PORT:-18081}"
+NO_QWEN="${MSSH_NO_QWEN:-0}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RELAY="$SCRIPT_DIR/oc-relay.py"
+TMPLOG="${TMPDIR:-/tmp}"
+
+ssh_opts=()
+while [ "$#" -gt 0 ] && [[ "$1" == -* ]]; do
+    ssh_opts+=("$1")
+    shift
+done
+
+if [ "$#" -eq 0 ]; then
+    echo "usage: mssh [ssh-options...] target [command...]" >&2
+    exit 2
+fi
+
+TARGET="$1"
+shift
+
+pids=()
+trap 'for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done' EXIT
+
+wait_port() {
+    local port="$1" pid="$2" label="$3" skip="${4:-0}"
+    for _ in $(seq 1 60); do
+        if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+            exec 3>&- 3<&-
+            return 0
+        fi
+        if ! kill -0 "$pid" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
+    echo "relay [$label] failed to start:" >&2
+    tail -20 "$TMPLOG/mssh-$label.log" 2>/dev/null >&2 || true
+    if [ "$skip" = "1" ]; then
+        return 1
+    fi
+    exit 1
+}
+
+# deepseek relay (auto-detected from active model)
+python3 "$RELAY" --port "$LOCAL" 2>"$TMPLOG/mssh-deepseek.log" &
+pids+=("$!")
+wait_port "$LOCAL" "$!" deepseek
+
+# qwen vLLM relay (optional)
+if [ "$NO_QWEN" != "1" ]; then
+    python3 "$RELAY" --model vllm --port "$QWEN_LOCAL" 2>"$TMPLOG/mssh-qwen.log" &
+    QPID=$!
+    pids+=("$QPID")
+    if ! wait_port "$QWEN_LOCAL" "$QPID" qwen 1; then
+        kill "$QPID" 2>/dev/null || true
+    else
+        QWEN_UP=1
+    fi
+fi
+
+FWD_DEEP="127.0.0.1:${REMOTE}:127.0.0.1:${LOCAL}"
+EXPORT="export ANTHROPIC_BASE_URL=http://127.0.0.1:${REMOTE} ANTHROPIC_API_KEY=local-bridge LLM_BASE_URL=http://127.0.0.1:${REMOTE}/v1"
+
+if [ "${QWEN_UP:-0}" = "1" ]; then
+    FWD_QWEN="127.0.0.1:${QWEN_REMOTE}:127.0.0.1:${QWEN_LOCAL}"
+    EXPORT+=" QWEN_BASE_URL=http://127.0.0.1:${QWEN_REMOTE}/v1"
+    if [ "$#" -eq 0 ]; then
+        ssh "${ssh_opts[@]}" -t -R "$FWD_DEEP" -R "$FWD_QWEN" "$TARGET" "$EXPORT; exec \$SHELL -il"
+    else
+        ssh "${ssh_opts[@]}" -R "$FWD_DEEP" -R "$FWD_QWEN" "$TARGET" "$EXPORT; $*"
+    fi
+else
+    if [ "$#" -eq 0 ]; then
+        ssh "${ssh_opts[@]}" -t -R "$FWD_DEEP" "$TARGET" "$EXPORT; exec \$SHELL -il"
+    else
+        ssh "${ssh_opts[@]}" -R "$FWD_DEEP" "$TARGET" "$EXPORT; $*"
+    fi
+fi
