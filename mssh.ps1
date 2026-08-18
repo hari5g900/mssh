@@ -78,6 +78,66 @@ try {
 }
 if ($eps.Count -eq 0) { Write-Host "no endpoints in $Config" -ForegroundColor Yellow; exit 1 }
 
+# --- free stale reverse-forwarded ports (abandoned mssh sessions) ---
+$portPattern = '(' + (($eps.Port | ForEach-Object { '127\.0\.0\.1:' + $_ + ':' }) -join '|') + ')'
+$sshIds = @(Get-Process ssh -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+if ($sshIds.Count -gt 0) {
+    $sshProcs = Get-CimInstance Win32_Process -Filter "Name = 'ssh.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $sshIds -contains $_.ProcessId }
+    foreach ($c in $sshProcs) {
+        if ($c.CommandLine -match '-R' -and $c.CommandLine -match $portPattern) {
+            Write-Host "killing stale local ssh (pid $($c.ProcessId)) holding a relay port" -ForegroundColor DarkYellow
+            Stop-Process -Id $c.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+$cleanupBash = @'
+user=$(id -u)
+who=$(getent passwd "$user" | cut -d: -f1)
+for port in "$@"; do
+    hex=$(printf '%04X' "$port")
+    if awk -v la="0100007F:$hex" '$2==la && $4=="0A" {f=1} END{exit !f}' /proc/net/tcp; then
+        echo "port $port is held on the remote; killing stale sshd sessions (oldest first)"
+        for d in $(ls -d /proc/[0-9]*); do
+            pid=${d#/proc/}
+            [ "$(stat -c %u "$d" 2>/dev/null)" = "$user" ] || continue
+            cmdline=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+            cmdline=${cmdline%"${cmdline##*[![:space:]]}"}
+            case "$cmdline" in
+                "sshd: $who"@*pts/*|"sshd: $who"@tty[0-9]*|"sshd: $who")
+                    start=$(awk '{print $22}' "$d/stat" 2>/dev/null)
+                    echo "$start|$pid|$cmdline"
+                    ;;
+            esac
+        done | sort -t'|' -k1 -n | while IFS='|' read start pid cmdline; do
+            echo "killing stale remote sshd pid $pid ($cmdline)"
+            kill -9 "$pid" 2>/dev/null
+            sleep 1
+            if ! awk -v la="0100007F:$hex" '$2==la && $4=="0A" {f=1} END{exit !f}' /proc/net/tcp; then
+                echo "port $port freed"
+                break
+            fi
+        done
+    fi
+done
+for port in "$@"; do
+    hex=$(printf '%04X' "$port")
+    if awk -v la="0100007F:$hex" '$2==la && $4=="0A" {f=1} END{exit !f}' /proc/net/tcp; then
+        echo "STILL-HELD $port"
+    fi
+done
+'@
+$b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($cleanupBash))
+$portsStr = ($eps.Port -join ' ')
+$cleanupArgs = @() + $extra + @($Target, "echo $b64 | base64 -d | bash -s $portsStr")
+try {
+    $cleanupOut = @(& ssh @cleanupArgs 2>&1 | ForEach-Object { "$_" })
+    foreach ($line in $cleanupOut) {
+        if ($line -match 'STILL-HELD') { Write-Host $line -ForegroundColor Yellow }
+        elseif ($line -match 'killing stale|port .* freed') { Write-Host $line -ForegroundColor DarkYellow }
+    }
+} catch { }
+
 # --- start one relay per endpoint and build the forwards + env exports ---
 $n = [guid]::NewGuid().ToString('N').Substring(0, 8)
 $procs = [System.Collections.ArrayList]::new()
