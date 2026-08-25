@@ -129,7 +129,7 @@ done
 '@
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($cleanupBash))
 $portsStr = ($eps.Port -join ' ')
-$cleanupArgs = @() + $extra + @($Target, "echo $b64 | base64 -d | bash -s $portsStr")
+$cleanupArgs = @('-o', 'RemoteCommand=none') + $extra + @($Target, "echo $b64 | base64 -d | bash -s $portsStr")
 try {
     $cleanupOut = @(& ssh @cleanupArgs 2>&1 | ForEach-Object { "$_" })
     foreach ($line in $cleanupOut) {
@@ -210,7 +210,7 @@ if ($okPorts.Count -eq 0) {
 }
 
 $exportStr = "export " + ($exportParts -join ' ')
-$sshArgsArr = @() + $fwdArgs + $extra
+$sshArgsArr = @('-o', 'RemoteCommand=none') + $fwdArgs + $extra
 if ($ForwardAgent) { $sshArgsArr += '-A' }
 
 try {
