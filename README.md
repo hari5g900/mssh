@@ -31,8 +31,10 @@ For each endpoint in the config, `mssh`:
 
 1. starts a **local relay** (`oc-relay.py`) that forwards requests to the real
    gateway and injects the API key locally,
-2. **reverse-forwards** the relay port to the remote (`ssh -R`, same port both
-   ends),
+2. **reverse-forwards** it to the remote (`ssh -R`): the **remote** side stays
+   on the configured port for that endpoint (agents installed on the remote
+   point at those specific ports), while the **local** relay port is picked
+   fresh per session so parallel sessions never collide on this machine,
 3. exports on the remote:
    - `<NAME>_BASE_URL=http://127.0.0.1:<port>` for **every** endpoint,
    - plus `ANTHROPIC_BASE_URL` and `LLM_BASE_URL` for the **first** endpoint
@@ -53,7 +55,9 @@ fill it in. `mssh` re-reads it on **every run** — edit the file, no reinstall.
     // name:   becomes <NAME>_BASE_URL on the remote
     // url:    base URL of the server THIS machine can reach (http/https, /v1-style)
     // apiKey: optional; injected locally, never sent to the remote
-    // port:   port on BOTH this machine and the remote (default 18080, 18081, ...)
+    // port:   the port exposed on the REMOTE (default 18080, 18081, ...).
+    //         Keep this fixed — agents installed on the remote point at these
+    //         ports. Only the local relay port is re-allocated per session.
     { "name": "deepseek", "url": "http://<your-server-1>:30800/v1", "apiKey": "", "port": 18080 },
     { "name": "qwen",     "url": "http://<your-server-2>:5007/v1", "port": 18081 }
   ]
@@ -183,6 +187,14 @@ Measured on loopback against a mock gateway:
 Each remote `mssh` run gets its own relays, so load is naturally sharded across
 machines.
 
+**Parallel sessions are fully supported.** The remote forward port stays on the
+fixed configured port (agents on the remote keep pointing at it), while the
+local relay port is re-allocated per session, so you can `mssh` many machines
+at once from this box — no session disturbs another, and `mssh` never kills an
+existing ssh/sshd session. (Two sessions against the *same* box share the same
+fixed remote ports, so only one holds each forward; ssh prints a harmless
+"remote port forwarding failed" warning for the second.)
+
 ---
 
 ## Security
@@ -209,8 +221,10 @@ machines.
   network). The remote can never fix this; reconnect this machine first.
 - **`claude` on the remote can't reach the endpoint** — confirm the tunnel:
   `curl -s http://127.0.0.1:<port>/v1/messages`.
-- **Port conflict on the remote** — change the `port` for that endpoint in
-  `endpoints.jsonc`.
+- **"remote port forwarding failed" on start** — the fixed remote port is
+  already held on that box (e.g. another session to it, or one that hasn't
+  timed out yet). Nothing was killed; that single forward is skipped, the
+  session still works. It clears once the other session ends.
 - **Auth rejected at the gateway** — `oc-relay.py` injects both `Authorization`
   and `x-api-key`; if your gateway expects another header, adjust
   `oc-relay.py`'s `_forward()`.

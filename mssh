@@ -10,6 +10,12 @@
 #   <NAME>_BASE_URL=http://127.0.0.1:<port>      (one per endpoint)
 #   ANTHROPIC_BASE_URL, LLM_BASE_URL            (first endpoint, for claude/opencode)
 #
+# The REMOTE forward port is the fixed configured port for each endpoint (the
+# agents installed on the remote point at those ports, e.g. 18080/18081).
+# Only the LOCAL relay port is allocated fresh per session, so any number of
+# mssh sessions can run at the same time (parallel machines, or several on
+# this machine) without colliding or killing each other's ssh/sshd processes.
+#
 # Requires nothing installed on the remote beyond sshd + your tools.
 #
 # Usage:
@@ -62,43 +68,66 @@ if [ "${#EPS[@]}" -eq 0 ]; then
     exit 1
 fi
 
-fwd_args=()
-export_str="export"
-first=1
+NAMES=(); URLS=(); KEYS=(); PORTS=()
 idx=0
-ports=()
 for line in "${EPS[@]}"; do
     IFS=$'\t' read -r name url key port <<<"$line"
     port="${port:-$((18080 + idx))}"
     idx=$((idx + 1))
-    ports+=("$port")
+    NAMES+=("$name"); URLS+=("$url"); KEYS+=("$key"); PORTS+=("$port")
+done
+
+# --- port allocation ---
+# The REMOTE forward port is FIXED to the configured port for each endpoint
+# (the agents installed on the remote point at those specific ports). Only the
+# LOCAL relay port is picked fresh per session, so parallel mssh sessions
+# (different machines, or several on this machine) never collide on loopback.
+# Nothing is ever killed: an abandoned session just leaves its local relay up
+# until the connection times out, and the next session picks another free
+# local port. If a fixed remote port is already held, ssh prints a "remote
+# port forwarding failed" warning and that one forward is skipped.
+salt=$((RANDOM % 1500))
+
+# --- start one relay per endpoint and build the forwards + env exports ---
+fwd_args=()
+export_str="export"
+first=1
+LOCAL_PORTS=()
+for idx in "${!NAMES[@]}"; do
+    remote_port="${PORTS[$idx]}"
+
+    # free LOCAL port (start scanning above the remote port)
+    local_port=$((remote_port + salt))
+    while (exec 3<>"/dev/tcp/127.0.0.1/$local_port") 2>/dev/null; do
+        local_port=$((local_port + 1))
+    done
+    LOCAL_PORTS+=("$local_port")
 
     # API key via env var, not argv (stays out of /proc cmdline and can't
     # inject extra arguments).
-    MSSH_KEY="$key" python3 "$RELAY" --target "$url" --port "$port" \
-        2>"$TMPLOG/mssh-$name.log" &
+    MSSH_KEY="${KEYS[$idx]}" python3 "$RELAY" --target "${URLS[$idx]}" --port "$local_port" \
+        2>"$TMPLOG/mssh-${NAMES[$idx]}.log" &
     pids+=("$!")
 
-    # Remote talks to the LOCAL forwarded port, never the upstream URL.
-    local_url="http://127.0.0.1:$port"
-    envname="$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')"
+    # Remote talks to the LOCAL forwarded port (remote_port), never the
+    # upstream URL.
+    envname="$(printf '%s' "${NAMES[$idx]}" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')"
     # single-quote the values (config-derived, fixed-form)
-    export_str+=" ${envname}_BASE_URL='$local_url'"
+    export_str+=" ${envname}_BASE_URL='http://127.0.0.1:$remote_port'"
     if [ "$first" = "1" ]; then
-        export_str+=" ANTHROPIC_BASE_URL='$local_url' LLM_BASE_URL='$local_url/v1'"
+        export_str+=" ANTHROPIC_BASE_URL='http://127.0.0.1:$remote_port' LLM_BASE_URL='http://127.0.0.1:$remote_port/v1'"
         first=0
     fi
 
-    fwd_args+=("-R" "127.0.0.1:${port}:127.0.0.1:${port}")
+    fwd_args+=("-R" "127.0.0.1:${remote_port}:127.0.0.1:${local_port}")
 done
 
-# --- wait for all relay ports ---
+# --- wait for all relay ports (the LOCAL listeners) ---
 up=0
-for ((t = 0; t < 120 && up < ${#ports[@]}; t++)); do
+for ((t = 0; t < 120 && up < ${#LOCAL_PORTS[@]}; t++)); do
     up=0
-    for pp in "${ports[@]}"; do
+    for pp in "${LOCAL_PORTS[@]}"; do
         if (exec 3<>"/dev/tcp/127.0.0.1/$pp") 2>/dev/null; then
-            exec 3>&- 3<&-
             up=$((up + 1))
         fi
     done
@@ -106,7 +135,7 @@ for ((t = 0; t < 120 && up < ${#ports[@]}; t++)); do
 done
 
 if [ "$#" -eq 0 ]; then
-    ssh "${ssh_opts[@]}" -t "${fwd_args[@]}" "$TARGET" "$export_str; exec \$SHELL -il"
+    ssh "${ssh_opts[@]}" -o RemoteCommand=none -t "${fwd_args[@]}" "$TARGET" "$export_str; exec \$SHELL -il"
 else
-    ssh "${ssh_opts[@]}" "${fwd_args[@]}" "$TARGET" "$export_str; $*"
+    ssh "${ssh_opts[@]}" -o RemoteCommand=none "${fwd_args[@]}" "$TARGET" "$export_str; $*"
 fi

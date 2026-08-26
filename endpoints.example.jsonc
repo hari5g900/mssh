@@ -7,8 +7,11 @@
   //             (http/https, /v1-style — clients append /v1/... themselves)
   //   - apiKey: optional; if set it is injected locally by the relay and never
   //             sent to the remote box
-  //   - port:   port exposed on BOTH this machine and the remote
-  //             (defaults: 18080, 18081, ... in order; keep them unique)
+  //   - port:   the port exposed on the REMOTE for this endpoint
+  //             (defaults: 18080, 18081, ... in order). Keep it FIXED — the
+  //             agents installed on the remote point at these specific ports;
+  //             only the LOCAL relay port is re-allocated per session so
+  //             parallel `mssh` runs on this machine never conflict.
   //
   // Every run of `mssh` re-reads this file and starts one relay + forward per
   // endpoint. On the remote each endpoint gets:

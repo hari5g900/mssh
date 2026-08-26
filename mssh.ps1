@@ -10,11 +10,16 @@
       * starts one local relay (oc-relay.py) per endpoint that forwards to the
         real gateway and injects the API key locally (keys never leave this
         machine, and nothing is installed on the remote);
-      * reverse-forwards each relay port to the remote via ssh -R (same port on
-        both ends);
+      * reverse-forwards each relay port to the remote via ssh -R;
       * exports on the remote, per endpoint:  <NAME>_BASE_URL=http://127.0.0.1:<port>
         The FIRST endpoint also gets ANTHROPIC_BASE_URL (for claude) and
         LLM_BASE_URL (for OpenAI-compatible clients).
+
+    Ports: the port on the REMOTE is always the configured port for that
+    endpoint (your remote agents are set up to use those fixed ports, e.g.
+    18080/18081). Only the LOCAL relay port is allocated fresh per run, so any
+    number of `mssh` sessions can run at the same time — many machines in
+    parallel — without colliding or touching each other's ssh/sshd processes.
 
 .PARAMETER Target
     SSH destination: an alias from ~/.ssh/config or user@host.
@@ -78,65 +83,35 @@ try {
 }
 if ($eps.Count -eq 0) { Write-Host "no endpoints in $Config" -ForegroundColor Yellow; exit 1 }
 
-# --- free stale reverse-forwarded ports (abandoned mssh sessions) ---
-$portPattern = '(' + (($eps.Port | ForEach-Object { '127\.0\.0\.1:' + $_ + ':' }) -join '|') + ')'
-$sshIds = @(Get-Process ssh -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
-if ($sshIds.Count -gt 0) {
-    $sshProcs = Get-CimInstance Win32_Process -Filter "Name = 'ssh.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $sshIds -contains $_.ProcessId }
-    foreach ($c in $sshProcs) {
-        if ($c.CommandLine -match '-R' -and $c.CommandLine -match $portPattern) {
-            Write-Host "killing stale local ssh (pid $($c.ProcessId)) holding a relay port" -ForegroundColor DarkYellow
-            Stop-Process -Id $c.ProcessId -Force -ErrorAction SilentlyContinue
-        }
+# --- port allocation ---
+# The REMOTE forward port is FIXED to the configured port for each endpoint:
+# the agents installed on the remote point at those specific ports. Only the
+# LOCAL relay port is picked fresh per session, so parallel mssh sessions
+# (different machines, or several on this machine) never collide on loopback.
+# Existing ssh/sshd/relay processes are never searched for or killed — an
+# abandoned session simply leaves its local relay up until the connection
+# times out, and the next session picks another free local port.
+#
+# If the fixed remote port is already held (e.g. another session to the same
+# box has it), ssh prints a "remote port forwarding failed" warning and that
+# one forward is skipped — nothing is killed.
+
+function Get-FreeLocalPort {
+    param([int]$Start)
+    for ($p = $Start; $p -lt ($Start + 2000); $p++) {
+        try {
+            $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $p)
+            $l.Start()
+            $l.Stop()
+            return [int]$p
+        } catch { }
     }
+    throw "no free loopback port found starting at $Start"
 }
-$cleanupBash = @'
-user=$(id -u)
-who=$(getent passwd "$user" | cut -d: -f1)
-for port in "$@"; do
-    hex=$(printf '%04X' "$port")
-    if awk -v la="0100007F:$hex" '$2==la && $4=="0A" {f=1} END{exit !f}' /proc/net/tcp; then
-        echo "port $port is held on the remote; killing stale sshd sessions (oldest first)"
-        for d in $(ls -d /proc/[0-9]*); do
-            pid=${d#/proc/}
-            [ "$(stat -c %u "$d" 2>/dev/null)" = "$user" ] || continue
-            cmdline=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
-            cmdline=${cmdline%"${cmdline##*[![:space:]]}"}
-            case "$cmdline" in
-                "sshd: $who"@*pts/*|"sshd: $who"@tty[0-9]*|"sshd: $who")
-                    start=$(awk '{print $22}' "$d/stat" 2>/dev/null)
-                    echo "$start|$pid|$cmdline"
-                    ;;
-            esac
-        done | sort -t'|' -k1 -n | while IFS='|' read start pid cmdline; do
-            echo "killing stale remote sshd pid $pid ($cmdline)"
-            kill -9 "$pid" 2>/dev/null
-            sleep 1
-            if ! awk -v la="0100007F:$hex" '$2==la && $4=="0A" {f=1} END{exit !f}' /proc/net/tcp; then
-                echo "port $port freed"
-                break
-            fi
-        done
-    fi
-done
-for port in "$@"; do
-    hex=$(printf '%04X' "$port")
-    if awk -v la="0100007F:$hex" '$2==la && $4=="0A" {f=1} END{exit !f}' /proc/net/tcp; then
-        echo "STILL-HELD $port"
-    fi
-done
-'@
-$b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($cleanupBash))
-$portsStr = ($eps.Port -join ' ')
-$cleanupArgs = @('-o', 'RemoteCommand=none') + $extra + @($Target, "echo $b64 | base64 -d | bash -s $portsStr")
-try {
-    $cleanupOut = @(& ssh @cleanupArgs 2>&1 | ForEach-Object { "$_" })
-    foreach ($line in $cleanupOut) {
-        if ($line -match 'STILL-HELD') { Write-Host $line -ForegroundColor Yellow }
-        elseif ($line -match 'killing stale|port .* freed') { Write-Host $line -ForegroundColor DarkYellow }
-    }
-} catch { }
+
+# Per-session offset so two concurrent runs don't start scanning from the same
+# number (the remote side still uses the fixed configured ports).
+$salt = Get-Random -Minimum 0 -Maximum 1500
 
 # --- start one relay per endpoint and build the forwards + env exports ---
 $n = [guid]::NewGuid().ToString('N').Substring(0, 8)
@@ -144,14 +119,14 @@ $procs = [System.Collections.ArrayList]::new()
 $logs = [System.Collections.ArrayList]::new()
 $fwdArgs = [System.Collections.ArrayList]::new()
 $exportParts = [System.Collections.ArrayList]::new()
-$ports = [System.Collections.ArrayList]::new()
+$localPorts = [System.Collections.ArrayList]::new()
 
 function Start-OneRelay {
-    param($Ep, [string]$Log)
+    param($Ep, [int]$Port, [string]$Log)
     # Values are wrapped in double quotes for the Windows command line; escape
     # any embedded quote so config data can't break out of its argument.
     $u = $Ep.Url.Replace('"', '\"')
-    $argsStr = '"{0}" --target "{1}" --port {2}' -f $Relay, $u, $Ep.Port
+    $argsStr = '"{0}" --target "{1}" --port {2}' -f $Relay, $u, $Port
     # Pass the API key via the environment, not the command line (no --key):
     # it never shows up in process listings and can't inject extra args.
     $oldKey = $env:MSSH_KEY
@@ -164,28 +139,44 @@ function Start-OneRelay {
     }
 }
 
-$first = $true
-foreach ($ep in $eps) {
-    $log = Join-Path $env:TEMP ("mssh-{0}-{1}.log" -f $ep.Name, $n)
-    $p = Start-OneRelay $ep $log
-    [void]$procs.Add($p); [void]$logs.Add($log); [void]$ports.Add($ep.Port)
-    [void]$fwdArgs.Add('-R'); [void]$fwdArgs.Add("127.0.0.1:$($ep.Port):127.0.0.1:$($ep.Port)")
+try {
+    $first = $true
+    for ($i = 0; $i -lt $eps.Count; $i++) {
+        $ep = $eps[$i]
+        # Fixed on the remote (agents there point at these ports); only the
+        # local relay port is chosen fresh for this session.
+        $remotePort = [int]$ep.Port
+        $localPort = Get-FreeLocalPort ($remotePort + $salt)
+        [void]$localPorts.Add($localPort)
 
-    # The remote talks to the LOCAL forwarded port, never the upstream URL.
-    $localUrl = "http://127.0.0.1:$($ep.Port)"
-    $envName = ($ep.Name.ToUpper() -replace '[^A-Z0-9]', '_')
-    # single-quote values: they're fixed-form and config-derived
-    [void]$exportParts.Add("${envName}_BASE_URL='$localUrl'")
-    if ($first) {
-        [void]$exportParts.Add("ANTHROPIC_BASE_URL='$localUrl'")
-        [void]$exportParts.Add("LLM_BASE_URL='$localUrl/v1'")
-        $first = $false
+        $log = Join-Path $env:TEMP ("mssh-{0}-{1}.log" -f $ep.Name, $n)
+        $p = Start-OneRelay $ep $localPort $log
+        [void]$procs.Add($p); [void]$logs.Add($log)
+        [void]$fwdArgs.Add('-R')
+        [void]$fwdArgs.Add("127.0.0.1:${remotePort}:127.0.0.1:${localPort}")
+
+        # The remote talks to the forwarded port (remotePort), never the
+        # upstream URL.
+        $envName = ($ep.Name.ToUpper() -replace '[^A-Z0-9]', '_')
+        # single-quote values: they're fixed-form and config-derived
+        [void]$exportParts.Add("${envName}_BASE_URL='http://127.0.0.1:${remotePort}'")
+        if ($first) {
+            [void]$exportParts.Add("ANTHROPIC_BASE_URL='http://127.0.0.1:${remotePort}'")
+            [void]$exportParts.Add("LLM_BASE_URL='http://127.0.0.1:${remotePort}/v1'")
+            $first = $false
+        }
     }
+} catch {
+    Write-Host "failed to allocate ports / start relays: $($_.Exception.Message)" -ForegroundColor Yellow
+    foreach ($p in $procs) {
+        if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+    }
+    exit 1
 }
 
-# --- wait for every relay port to come up ---
+# --- wait for every relay port to come up (the LOCAL listener) ---
 $okPorts = @()
-foreach ($port in $ports) {
+foreach ($port in $localPorts) {
     $ready = $false
     for ($i = 0; $i -lt 60; $i++) {
         try {
@@ -198,7 +189,7 @@ foreach ($port in $ports) {
         Start-Sleep -Milliseconds 150
     }
     if (-not $ready) {
-        Write-Host "a relay for port $port failed to start" -ForegroundColor Yellow
+        Write-Host "a relay for local port $port failed to start" -ForegroundColor Yellow
     } else {
         $okPorts += $port
     }
