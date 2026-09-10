@@ -23,6 +23,6 @@
   // repository is public and history is forever.
   "endpoints": [
     { "name": "deepseek", "url": "http://<your-server-1>:30800/v1", "apiKey": "", "port": 18080 },
-    { "name": "qwen",     "url": "http://<your-server-2>:5007/v1", "port": 18081 }
+    { "name": "qwen",     "url": "http://10.68.184.17:17010/v1", "port": 18081 }
   ]
 }
