@@ -34,6 +34,12 @@
 .PARAMETER ForwardAgent
     -A  Enable SSH agent forwarding (ssh -A).
 
+.PARAMETER Steal
+    Before connecting, kill this user's stale sshd sessions on the remote that
+    hold the configured forward ports (oldest first, until each port frees).
+    Use when an abandoned session blocks the fixed remote ports. Note: it
+    cannot tell abandoned from live sessions, so it may kill an active one.
+
 .PARAMETER SshArgs
     Extra ssh options as a single string, e.g. "-p 2222 -i ~/.ssh/id_ed25519".
 
@@ -50,6 +56,7 @@ param(
 
     [Alias('A')]
     [switch]$ForwardAgent,
+    [switch]$Steal,
     [string]$SshArgs = "",
     [string]$Config = ""
 )
@@ -82,6 +89,60 @@ try {
     exit 1
 }
 if ($eps.Count -eq 0) { Write-Host "no endpoints in $Config" -ForegroundColor Yellow; exit 1 }
+
+# --- optional: -Steal frees ports held by stale remote sessions ---
+if ($Steal) {
+    $cleanupBash = @'
+user=$(id -u)
+who=$(getent passwd "$user" | cut -d: -f1)
+for port in "$@"; do
+    hex=$(printf '%04X' "$port")
+    if awk -v la="0100007F:$hex" '$2==la && $4=="0A" {f=1} END{exit !f}' /proc/net/tcp; then
+        echo "port $port is held on the remote; killing stale sshd sessions (oldest first)"
+        for d in $(ls -d /proc/[0-9]* 2>/dev/null); do
+            pid=${d#/proc/}
+            [ "$(stat -c %u "$d" 2>/dev/null)" = "$user" ] || continue
+            cmdline=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+            cmdline=${cmdline%"${cmdline##*[![:space:]]}"}
+            case "$cmdline" in
+                "sshd: $who"@*pts/*|"sshd: $who"@tty[0-9]*|"sshd: $who")
+                    start=$(awk '{print $22}' "$d/stat" 2>/dev/null)
+                    echo "$start|$pid|$cmdline"
+                    ;;
+            esac
+        done | sort -t'|' -k1 -n | while IFS='|' read start pid cmdline; do
+            echo "killing stale remote sshd pid $pid ($cmdline)"
+            kill -9 "$pid" 2>/dev/null
+            sleep 1
+            if ! awk -v la="0100007F:$hex" '$2==la && $4=="0A" {f=1} END{exit !f}' /proc/net/tcp; then
+                echo "port $port freed"
+                break
+            fi
+        done
+    fi
+done
+for port in "$@"; do
+    hex=$(printf '%04X' "$port")
+    if awk -v la="0100007F:$hex" '$2==la && $4=="0A" {f=1} END{exit !f}' /proc/net/tcp; then
+        echo "STILL-HELD $port"
+    fi
+done
+'@
+    $portsStr = ($eps.Port -join ' ')
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($cleanupBash -replace "`r", "")))
+    $cleanupArgs = @('-o', 'RemoteCommand=none') + $extra + @($Target, "echo $b64 | base64 -d | bash -s $portsStr")
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $cleanupOut = @(& ssh @cleanupArgs 2>&1 | ForEach-Object { "$_" })
+        foreach ($line in $cleanupOut) {
+            if ($line -match 'STILL-HELD') { Write-Host $line -ForegroundColor Yellow }
+            elseif ($line -match 'killing stale|port .* freed') { Write-Host $line -ForegroundColor DarkYellow }
+        }
+    } catch { } finally {
+        $ErrorActionPreference = $oldEap
+    }
+}
 
 # --- port allocation ---
 # The REMOTE forward port is FIXED to the configured port for each endpoint:

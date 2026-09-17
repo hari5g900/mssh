@@ -135,6 +135,7 @@ function mssh { & "C:\path\to\mssh\mssh.ps1" @args }
 | `-Command` | command to run instead of an interactive shell |
 | `-Config <path>` | endpoints config file (default: `endpoints.jsonc` beside the script) |
 | `-A` / `-ForwardAgent` | enable SSH agent forwarding (`ssh -A`) |
+| `-Steal` | before connecting, kill this user's stale sshd sessions on the remote that hold the configured forward ports (oldest first). Use when an abandoned session blocks the ports; it cannot tell abandoned from live sessions. |
 | `-SshArgs "<opts>"` | extra ssh options, e.g. `"-p 2222 -i <key>"` |
 
 ### bash (`mssh`)
@@ -222,9 +223,10 @@ fixed remote ports, so only one holds each forward; ssh prints a harmless
 - **`claude` on the remote can't reach the endpoint** — confirm the tunnel:
   `curl -s http://127.0.0.1:<port>/v1/messages`.
 - **"remote port forwarding failed" on start** — the fixed remote port is
-  already held on that box (e.g. another session to it, or one that hasn't
-  timed out yet). Nothing was killed; that single forward is skipped, the
-  session still works. It clears once the other session ends.
+  already held on that box (e.g. an abandoned session that never timed out).
+  Nothing is killed by default; that forward is skipped. Re-run with
+  `mssh -Steal <target>` to kill the stale remote sessions holding the ports
+  (oldest first) and take them over.
 - **Auth rejected at the gateway** — `oc-relay.py` injects both `Authorization`
   and `x-api-key`; if your gateway expects another header, adjust
   `oc-relay.py`'s `_forward()`.
