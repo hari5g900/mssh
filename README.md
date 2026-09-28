@@ -143,6 +143,7 @@ function mssh { & "C:\path\to\mssh\mssh.ps1" @args }
 | Env var | Meaning |
 |---|---|
 | `MSSH_CONFIG` | endpoints config path (default: `endpoints.jsonc` beside the script) |
+| `-Steal` | before connecting, kill this user’s stale sshd sessions on the remote that hold the configured forward ports (oldest first), same as PowerShell `-Steal` — e.g. `mssh -Steal <target>` |
 
 Extra ssh flags pass through directly after options: `mssh -A -p 2222 user@host`
 (`-A` forwards your ssh-agent, same as `ssh -A`). Ports come from the config

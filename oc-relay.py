@@ -19,6 +19,7 @@ Usage:
     oc-relay.py --endpoints [PATH]        # print endpoint list as TSV, exit
 """
 
+from __future__ import annotations
 import argparse
 import http.client
 import http.server

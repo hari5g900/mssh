@@ -1,0 +1,10 @@
+# Normalize line endings across machines (this repo is used from Windows and
+# macOS via OneDrive). Bash scripts must stay LF or their shebangs break
+# ("env: bash\r: No such file or directory"); PowerShell stays CRLF.
+*        text=auto
+*.py     text eol=lf
+*.sh     text eol=lf
+mssh     text eol=lf
+*.md     text eol=lf
+*.jsonc  text eol=lf
+*.ps1    text eol=crlf
