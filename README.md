@@ -169,8 +169,12 @@ python oc-relay.py --target http://host:PORT/v1 --key KEY --port 18080   # one e
   duplicating `/v1` (`/v1` + `/v1/messages` → `/v1/messages`).
 - **Streaming:** responses relay byte-by-byte with the client leg closed at the
   end — SSE token streaming works in near real time.
-- **Keep-alive pooling:** upstream connections reused (bounded pool, stale
-  connections retried once) — essentially zero added latency per request.
+- **Keep-alive pooling:** upstream connections reused (bounded pool), but
+  entries idle beyond ~4s are discarded — gateways (vLLM/uvicorn) close idle
+  keep-alive sockets after ~5s, so a dead socket is never handed out — and a
+  request that still dies on a reused socket before any response byte is
+  retried once on a fresh connection, even a POST (same rule browsers and
+  undici/urllib3 apply). Essentially zero added latency per request.
 - **Loopback only:** relays bind to `127.0.0.1`; nothing is exposed on the LAN.
 
 ---
@@ -239,9 +243,11 @@ fixed remote ports, so only one holds each forward; ssh prints a harmless
 Self-contained tests (Python 3.10+, no deps). From the repo root:
 
 ```bash
+```bash
 python tests/test_relay.py         # auth injection, wrong-key override, path routing, SSE
 python tests/bench_relay.py        # latency: direct vs. through the relay (keep-alive)
 python tests/test_concurrency.py   # 4/16/32 concurrent streaming streams
+python tests/test_stale_pool.py    # gateway closes idle keep-alive conns -> POSTs still succeed
 ```
 
 `tests/mock_server.py` is a tiny fake gateway; everything runs on loopback.

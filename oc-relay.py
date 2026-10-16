@@ -29,6 +29,7 @@ import re
 import socket
 import sys
 import threading
+import time
 import urllib.parse
 
 
@@ -121,19 +122,36 @@ def read_endpoints(config_path: str | None = None) -> list:
 # --- keep-alive connection pool (relay -> upstream gateway) ---
 # `http.client` connections are not thread-safe, so a connection is only ever
 # used by one request thread at a time (it is popped under the lock, used
-# exclusively, then returned).
-_pool: list = []
+# exclusively, then returned). Entries carry the time they were pooled: a
+# gateway (vLLM/uvicorn) closes idle keep-alive connections after ~5s, so an
+# entry idle longer than _POOL_TTL is discarded on pop instead of being
+# handed out dead.
+_pool: list = []  # entries: (conn, pooled_at monotonic)
 _pool_lock = threading.Lock()
 _POOL_MAX = 16
+_POOL_TTL = 4.0  # keep below the gateway's own keep-alive timeout
 
 
-def _pool_get(scheme: str, host: str, port: int, timeout: int):
-    with _pool_lock:
-        if _pool:
-            return _pool.pop()
+def _pool_get(scheme: str, host: str, port: int, timeout: int,
+              fresh: bool = False):
+    """Return (connection, reused). fresh=True skips the pool; stale entries
+    (idle beyond _POOL_TTL) are closed and skipped."""
+    if not fresh:
+        while True:
+            with _pool_lock:
+                entry = _pool.pop() if _pool else None
+            if entry is None:
+                break
+            conn, pooled_at = entry
+            if time.monotonic() - pooled_at <= _POOL_TTL:
+                return conn, True
+            try:
+                conn.close()
+            except Exception:
+                pass
     if scheme == "https":
-        return http.client.HTTPSConnection(host, port, timeout=timeout)
-    return http.client.HTTPConnection(host, port, timeout=timeout)
+        return http.client.HTTPSConnection(host, port, timeout=timeout), False
+    return http.client.HTTPConnection(host, port, timeout=timeout), False
 
 
 def _pool_put(conn, reusable: bool) -> None:
@@ -145,7 +163,7 @@ def _pool_put(conn, reusable: bool) -> None:
         return
     with _pool_lock:
         if len(_pool) < _POOL_MAX:
-            _pool.append(conn)
+            _pool.append((conn, time.monotonic()))
         else:
             try:
                 conn.close()
@@ -200,14 +218,16 @@ class Relay(http.server.BaseHTTPRequestHandler):
         if "?" not in path and parsed.query:
             path += "?" + parsed.query
 
-        # acquire a pooled connection; retry once if it went stale while idle.
-        # Never retry non-idempotent writes (a retried POST could generate the
-        # request twice upstream).
+        # Acquire a pooled connection; if the request dies before any
+        # response byte, retry once on a FRESH connection. That is safe even
+        # for POST when the failed socket was REUSED: the gateway closed the
+        # idle keep-alive connection before the request arrived (this is what
+        # browsers/urllib3/undici do for their own pools). A failure on a
+        # fresh socket is only retried for idempotent methods.
         idempotent = self.command in ("GET", "HEAD", "OPTIONS", "DELETE")
-        attempts = 2 if idempotent else 1
-        conn = _pool_get(parsed.scheme, host, port, self.timeout)
+        conn, reused = _pool_get(parsed.scheme, host, port, self.timeout)
         resp = None
-        for _attempt in range(attempts):
+        for _attempt in range(2):
             try:
                 conn.request(self.command, path, body=body, headers=headers)
                 resp = conn.getresponse()
@@ -217,9 +237,10 @@ class Relay(http.server.BaseHTTPRequestHandler):
                     conn.close()
                 except Exception:
                     pass
-                if _attempt == attempts - 1:
+                if _attempt == 1 or not (idempotent or reused):
                     raise
-                conn = _pool_get(parsed.scheme, host, port, self.timeout)
+                conn = _pool_get(parsed.scheme, host, port, self.timeout,
+                                 fresh=True)[0]
 
         # client leg always closes: responses without a content-length (SSE)
         # rely on EOF to signal the end of the stream
