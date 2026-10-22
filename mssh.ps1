@@ -13,7 +13,6 @@
       * reverse-forwards each relay port to the remote via ssh -R;
       * exports on the remote, per endpoint:  <NAME>_BASE_URL=http://127.0.0.1:<port>
         The FIRST endpoint also gets LLM_BASE_URL (for OpenAI-compatible clients).
-        LLM_BASE_URL (for OpenAI-compatible clients).
 
     Ports: the port on the REMOTE is always the configured port for that
     endpoint (your remote agents are set up to use those fixed ports, e.g.
@@ -39,6 +38,12 @@
     hold the configured forward ports (oldest first, until each port frees).
     Use when an abandoned session blocks the fixed remote ports. Note: it
     cannot tell abandoned from live sessions, so it may kill an active one.
+
+.PARAMETER Internet
+    Give the remote internet access through this machine: runs the repo's
+    socks5.py (1080) and http_proxy.py (1081) locally if not already
+    listening, reverse-forwards them, and exports http_proxy/https_proxy/
+    no_proxy on the remote (127.0.0.1 relay endpoints bypass the proxy).
 
 .PARAMETER SshArgs
     Extra ssh options as a single string, e.g. "-p 2222 -i ~/.ssh/id_ed25519".
@@ -263,13 +268,15 @@ if ($okPorts.Count -eq 0) {
     exit 1
 }
 if ($Internet) {
-    # This machine's web proxies (minimal python proxies in
-    # $env:TEMP\opencode\): SOCKS5 on 1080, HTTP on 1081. They are session-
-    # independent infra: started if not listening, left running afterwards.
+    # This machine's web proxies (the repo's socks5.py / http_proxy.py;
+    # an earlier copy may live in $env:TEMP\opencode\): SOCKS5 on 1080,
+    # HTTP on 1081. They are session-independent infra: started if not
+    # listening, left running afterwards.
     $proxies = @(
         @{ Port = 1080; Script = 'socks5.py' },
         @{ Port = 1081; Script = 'http_proxy.py' }
     )
+    $readyProxies = @()
     foreach ($px in $proxies) {
         $listening = $false
         try {
@@ -279,15 +286,16 @@ if ($Internet) {
             $c.Close()
         } catch { }
         if (-not $listening) {
-            $script = Join-Path $env:TEMP (Join-Path 'opencode' $px.Script)
+            $script = Join-Path $ScriptDir $px.Script
             if (-not (Test-Path $script)) {
-                Write-Host "internet proxy script missing: $script" -ForegroundColor Yellow
+                $script = Join-Path $env:TEMP (Join-Path 'opencode' $px.Script)
+            }
+            if (-not (Test-Path $script)) {
+                Write-Host "internet proxy script missing: $($px.Script)" -ForegroundColor Yellow
                 continue
             }
             Start-Process -FilePath python -ArgumentList ('"' + $script + '"') -WindowStyle Hidden | Out-Null
         }
-        [void]$fwdArgs.Add('-R')
-        [void]$fwdArgs.Add("127.0.0.1:$($px.Port):127.0.0.1:$($px.Port)")
         $ready = $false
         for ($i = 0; $i -lt 40; $i++) {
             try {
@@ -299,17 +307,33 @@ if ($Internet) {
             if ($ready) { break }
             Start-Sleep -Milliseconds 150
         }
-        if (-not $ready) { Write-Host "internet proxy on $($px.Port) did not start" -ForegroundColor Yellow }
+        if (-not $ready) {
+            # no forward and no exports: pointing the remote's traffic at a
+            # dead tunnel would break all of its proxied requests
+            Write-Host "internet proxy on $($px.Port) did not start" -ForegroundColor Yellow
+            continue
+        }
+        [void]$fwdArgs.Add('-R')
+        [void]$fwdArgs.Add("127.0.0.1:$($px.Port):127.0.0.1:$($px.Port)")
+        $readyProxies += $px.Port
     }
-    # The remote's internet goes through this machine's HTTP proxy. The
-    # relay exports (127.0.0.1:<endpoint port>) must bypass it or the LLM
-    # calls would be routed into this machine's loopback and die.
-    [void]$exportParts.Add("http_proxy='http://127.0.0.1:1081'")
-    [void]$exportParts.Add("https_proxy='http://127.0.0.1:1081'")
-    [void]$exportParts.Add("HTTP_PROXY='http://127.0.0.1:1081'")
-    [void]$exportParts.Add("HTTPS_PROXY='http://127.0.0.1:1081'")
-    [void]$exportParts.Add("ALL_PROXY='http://127.0.0.1:1081'")
-    [void]$exportParts.Add("NO_PROXY='localhost,127.0.0.1'")
+    # The remote's internet goes through this machine's HTTP proxy. Only
+    # export the env when the proxy is actually up. The relay exports
+    # (127.0.0.1:<endpoint port>) must bypass it or the LLM calls would be
+    # routed into this machine's loopback and die; python tools on the
+    # remote only read the lowercase no_proxy, so export both cases.
+    if ($readyProxies -contains 1081) {
+        [void]$exportParts.Add("http_proxy='http://127.0.0.1:1081'")
+        [void]$exportParts.Add("https_proxy='http://127.0.0.1:1081'")
+        [void]$exportParts.Add("HTTP_PROXY='http://127.0.0.1:1081'")
+        [void]$exportParts.Add("HTTPS_PROXY='http://127.0.0.1:1081'")
+        [void]$exportParts.Add("all_proxy='http://127.0.0.1:1081'")
+        [void]$exportParts.Add("ALL_PROXY='http://127.0.0.1:1081'")
+    }
+    if ($readyProxies.Count -gt 0) {
+        [void]$exportParts.Add("NO_PROXY='localhost,127.0.0.1'")
+        [void]$exportParts.Add("no_proxy='localhost,127.0.0.1'")
+    }
 }
 
 

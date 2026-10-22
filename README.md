@@ -23,8 +23,8 @@ THIS machine (owns the keys, can reach the gateways — e.g. via VPN/tailnet)
   ├─ oc-relay (endpoint 1) :18080 ─┐
   ├─ oc-relay (endpoint 2) :18081 ─┤── ssh -R ... ──►  REMOTE
   │                                │                   ├─ <NAME>_BASE_URL (per endpoint)
-  └─ keys never leave here  ◄──────┘                   ├─ ANTHROPIC_BASE_URL  (first)
-                                                       └─ LLM_BASE_URL        (first)
+  └─ keys never leave here  ◄──────┘                   ├─ LLM_BASE_URL        (first)
+                                                       └─ internet proxy env  (-Internet)
 ```
 
 For each endpoint in the config, `mssh`:
@@ -37,8 +37,10 @@ For each endpoint in the config, `mssh`:
    fresh per session so parallel sessions never collide on this machine,
 3. exports on the remote:
    - `<NAME>_BASE_URL=http://127.0.0.1:<port>` for **every** endpoint,
-   - plus `ANTHROPIC_BASE_URL` and `LLM_BASE_URL` for the **first** endpoint
-     (convenience aliases for claude and OpenAI-compatible clients),
+   - plus `LLM_BASE_URL` for the **first** endpoint (OpenAI-compatible
+     clients; point claude at it by exporting `ANTHROPIC_BASE_URL` yourself),
+   - with `-Internet`: `http_proxy`/`https_proxy`/`no_proxy` so the remote
+     reaches the web through this machine (loopback endpoints bypass it),
 4. starts your remote shell (or runs your command), then cleans everything up
    when you disconnect.
 
@@ -83,6 +85,7 @@ fill it in. `mssh` re-reads it on **every run** — edit the file, no reinstall.
 | `mssh` | bash wrapper (macOS / Linux / WSL). |
 | `install.sh` | Installer (macOS / Linux): copies `mssh` + `oc-relay.py` (and the endpoint template) into a bin dir. |
 | `endpoints.example.jsonc` | Template you copy to `endpoints.jsonc` and fill in. |
+| `socks5.py` / `http_proxy.py` | Local proxies for `-Internet` (SOCKS5 1080, HTTP 1081): loopback-only, stdlib-only, left running once started. |
 
 ---
 
@@ -112,9 +115,10 @@ On the remote, your tools now see localhost endpoints that act like your real
 servers:
 
 ```bash
-claude                      # uses $ANTHROPIC_BASE_URL (first endpoint)
 opencode                    # point it at $LLM_BASE_URL / <NAME>_BASE_URL
+claude                      # export ANTHROPIC_BASE_URL=$LLM_BASE_URL first
 curl -s http://127.0.0.1:18080/v1/messages   # sanity-check a forward
+curl -s https://example.com                  # with -Internet: goes through this machine
 ```
 
 **Windows PowerShell:** add to `$PROFILE`:
@@ -135,7 +139,8 @@ function mssh { & "C:\path\to\mssh\mssh.ps1" @args }
 | `-Command` | command to run instead of an interactive shell |
 | `-Config <path>` | endpoints config file (default: `endpoints.jsonc` beside the script) |
 | `-A` / `-ForwardAgent` | enable SSH agent forwarding (`ssh -A`) |
-| `-Steal` | before connecting, kill this user's stale sshd sessions on the remote that hold the configured forward ports (oldest first). Use when an abandoned session blocks the ports; it cannot tell abandoned from live sessions. |
+| `-Steal` | before connecting, kill this user's stale sshd sessions on the remote that hold the configured forward ports (oldest first, plus the -Internet proxy ports 1080/1081). Use when an abandoned session blocks the ports; it cannot tell abandoned from live sessions. |
+| `-Internet` | give the remote internet access through this machine: runs the repo's `socks5.py` (1080) and `http_proxy.py` (1081) locally if not listening, reverse-forwards them, and exports `http_proxy`/`https_proxy`/`no_proxy` on the remote. Proxy env is only exported when the proxy actually came up. |
 | `-SshArgs "<opts>"` | extra ssh options, e.g. `"-p 2222 -i <key>"` |
 
 ### bash (`mssh`)
@@ -243,11 +248,11 @@ fixed remote ports, so only one holds each forward; ssh prints a harmless
 Self-contained tests (Python 3.10+, no deps). From the repo root:
 
 ```bash
-```bash
 python tests/test_relay.py         # auth injection, wrong-key override, path routing, SSE
 python tests/bench_relay.py        # latency: direct vs. through the relay (keep-alive)
 python tests/test_concurrency.py   # 4/16/32 concurrent streaming streams
 python tests/test_stale_pool.py    # gateway closes idle keep-alive conns -> POSTs still succeed
+python tests/test_proxies.py       # -Internet proxies: http CONNECT/absolute-URI, socks5 CONNECT
 ```
 
 `tests/mock_server.py` is a tiny fake gateway; everything runs on loopback.
