@@ -12,7 +12,7 @@
         machine, and nothing is installed on the remote);
       * reverse-forwards each relay port to the remote via ssh -R;
       * exports on the remote, per endpoint:  <NAME>_BASE_URL=http://127.0.0.1:<port>
-        The FIRST endpoint also gets ANTHROPIC_BASE_URL (for claude) and
+        The FIRST endpoint also gets LLM_BASE_URL (for OpenAI-compatible clients).
         LLM_BASE_URL (for OpenAI-compatible clients).
 
     Ports: the port on the REMOTE is always the configured port for that
@@ -57,6 +57,7 @@ param(
     [Alias('A')]
     [switch]$ForwardAgent,
     [switch]$Steal,
+    [switch]$Internet,
     [string]$SshArgs = "",
     [string]$Config = ""
 )
@@ -129,6 +130,7 @@ for port in "$@"; do
 done
 '@
     $portsStr = ($eps.Port -join ' ')
+    if ($Internet) { $portsStr = "$portsStr 1080 1081" }
     $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($cleanupBash -replace "`r", "")))
     $cleanupArgs = @('-o', 'RemoteCommand=none') + $extra + @($Target, "echo $b64 | base64 -d | bash -s $portsStr")
     $oldEap = $ErrorActionPreference
@@ -222,10 +224,10 @@ try {
         # single-quote values: they're fixed-form and config-derived
         [void]$exportParts.Add("${envName}_BASE_URL='http://127.0.0.1:${remotePort}'")
         if ($first) {
-            [void]$exportParts.Add("ANTHROPIC_BASE_URL='http://127.0.0.1:${remotePort}'")
             [void]$exportParts.Add("LLM_BASE_URL='http://127.0.0.1:${remotePort}/v1'")
             $first = $false
         }
+
     }
 } catch {
     Write-Host "failed to allocate ports / start relays: $($_.Exception.Message)" -ForegroundColor Yellow
@@ -260,9 +262,65 @@ if ($okPorts.Count -eq 0) {
     foreach ($log in $logs) { Get-Content $log -ErrorAction SilentlyContinue }
     exit 1
 }
+if ($Internet) {
+    # This machine's web proxies (minimal python proxies in
+    # $env:TEMP\opencode\): SOCKS5 on 1080, HTTP on 1081. They are session-
+    # independent infra: started if not listening, left running afterwards.
+    $proxies = @(
+        @{ Port = 1080; Script = 'socks5.py' },
+        @{ Port = 1081; Script = 'http_proxy.py' }
+    )
+    foreach ($px in $proxies) {
+        $listening = $false
+        try {
+            $c = New-Object System.Net.Sockets.TcpClient
+            $a = $c.BeginConnect('127.0.0.1', $px.Port, $null, $null)
+            if ($a.AsyncWaitHandle.WaitOne(150) -and $c.Connected) { $listening = $true }
+            $c.Close()
+        } catch { }
+        if (-not $listening) {
+            $script = Join-Path $env:TEMP (Join-Path 'opencode' $px.Script)
+            if (-not (Test-Path $script)) {
+                Write-Host "internet proxy script missing: $script" -ForegroundColor Yellow
+                continue
+            }
+            Start-Process -FilePath python -ArgumentList ('"' + $script + '"') -WindowStyle Hidden | Out-Null
+        }
+        [void]$fwdArgs.Add('-R')
+        [void]$fwdArgs.Add("127.0.0.1:$($px.Port):127.0.0.1:$($px.Port)")
+        $ready = $false
+        for ($i = 0; $i -lt 40; $i++) {
+            try {
+                $c = New-Object System.Net.Sockets.TcpClient
+                $a = $c.BeginConnect('127.0.0.1', $px.Port, $null, $null)
+                if ($a.AsyncWaitHandle.WaitOne(150) -and $c.Connected) { $ready = $true }
+                $c.Close()
+            } catch { }
+            if ($ready) { break }
+            Start-Sleep -Milliseconds 150
+        }
+        if (-not $ready) { Write-Host "internet proxy on $($px.Port) did not start" -ForegroundColor Yellow }
+    }
+    # The remote's internet goes through this machine's HTTP proxy. The
+    # relay exports (127.0.0.1:<endpoint port>) must bypass it or the LLM
+    # calls would be routed into this machine's loopback and die.
+    [void]$exportParts.Add("http_proxy='http://127.0.0.1:1081'")
+    [void]$exportParts.Add("https_proxy='http://127.0.0.1:1081'")
+    [void]$exportParts.Add("HTTP_PROXY='http://127.0.0.1:1081'")
+    [void]$exportParts.Add("HTTPS_PROXY='http://127.0.0.1:1081'")
+    [void]$exportParts.Add("ALL_PROXY='http://127.0.0.1:1081'")
+    [void]$exportParts.Add("NO_PROXY='localhost,127.0.0.1'")
+}
+
 
 $exportStr = "export " + ($exportParts -join ' ')
-$sshArgsArr = @('-o', 'RemoteCommand=none') + $fwdArgs + $extra
+ # Keepalives: application-level pings every 20s tolerate ~3 min of
+ # network loss (NAT timeouts, brief standby) before the session dies.
+ # A full system sleep still kills TCP — see the powercfg note in the docs.
+$sshArgsArr = @('-o', 'RemoteCommand=none',
+    '-o', 'ServerAliveInterval=20',
+    '-o', 'ServerAliveCountMax=9',
+    '-o', 'TCPKeepAlive=yes') + $fwdArgs + $extra
 if ($ForwardAgent) { $sshArgsArr += '-A' }
 
 try {
